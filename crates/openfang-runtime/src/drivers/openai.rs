@@ -839,25 +839,63 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
+                    let mut parts: Vec<OaiContentPart> = Vec::new();
+                    let mut has_tool_results = false;
                     for block in blocks {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } = block
-                        {
-                            oai_messages.push(OaiMessage {
-                                role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(if content.is_empty() {
-                                    "(empty)".to_string()
-                                } else {
-                                    content.clone()
-                                })),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                                reasoning_content: None,
-                            });
+                        match block {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                ..
+                            } => {
+                                has_tool_results = true;
+                                oai_messages.push(OaiMessage {
+                                    role: "tool".to_string(),
+                                    content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                        "(empty)".to_string()
+                                    } else {
+                                        content.clone()
+                                    })),
+                                    tool_calls: None,
+                                    tool_call_id: Some(tool_use_id.clone()),
+                                    reasoning_content: None,
+                                });
+                            }
+                            ContentBlock::Text { text, .. } => {
+                                parts.push(OaiContentPart::Text { text: text.clone() });
+                            }
+                            ContentBlock::Image { media_type, data } => {
+                                parts.push(OaiContentPart::ImageUrl {
+                                    image_url: OaiImageUrl {
+                                        url: format!("data:{media_type};base64,{data}"),
+                                    },
+                                });
+                            }
+                            ContentBlock::Document { media_type, data } => {
+                                if media_type.starts_with("text/") || media_type == "application/pdf" {
+                                    use base64::Engine;
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                                        if let Ok(text) = String::from_utf8(bytes) {
+                                            let label = media_type.split('/').last().unwrap_or("document");
+                                            parts.push(OaiContentPart::Text {
+                                                text: format!("[{label} file content]\n{text}"),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            ContentBlock::Thinking { .. } => {}
+                            _ => {}
                         }
+                    }
+                    if !parts.is_empty() && !has_tool_results {
+                        oai_messages.push(OaiMessage {
+                            role: "user".to_string(),
+                            content: Some(OaiMessageContent::Parts(parts)),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        });
                     }
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {

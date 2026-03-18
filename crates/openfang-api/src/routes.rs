@@ -322,15 +322,45 @@ pub fn resolve_attachments(
             continue;
         }
 
-        if media_type.starts_with("image/") {
+        // For Office Open XML formats (docx/xlsx/pptx), extract plain text before
+        // creating a ContentBlock. LLM APIs (OpenAI-compatible/Claude/Gemini) do not
+        // accept OOXML MIME types natively; converting to text/plain makes the content
+        // readable by all drivers.
+        let (final_media_type, final_data_b64) = if is_office_openxml_type(&media_type) {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                Ok(bytes) => match extract_office_text(&media_type, &bytes) {
+                    Some(text) => {
+                        let text_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+                        ("text/plain".to_string(), text_b64)
+                    }
+                    None => {
+                        tracing::warn!(
+                            media_type = %media_type,
+                            "Failed to extract text from Office document; skipping attachment"
+                        );
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to decode base64 for Office attachment");
+                    continue;
+                }
+            }
+        } else {
+            (media_type, data_b64)
+        };
+
+        if final_media_type.starts_with("image/") {
             blocks.push(ContentBlock::Image {
-                media_type,
-                data: data_b64,
+                media_type: final_media_type,
+                data: final_data_b64,
             });
         } else {
             blocks.push(ContentBlock::Document {
-                media_type,
-                data: data_b64,
+                media_type: final_media_type,
+                data: final_data_b64,
             });
         }
     }
@@ -338,11 +368,121 @@ pub fn resolve_attachments(
     blocks
 }
 
+/// Returns true if the MIME type is an Office Open XML format requiring text extraction.
+fn is_office_openxml_type(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+}
+
+/// Extract readable plain text from an Office Open XML document (docx/xlsx/pptx).
+///
+/// OOXML files are ZIP archives containing XML. We read the primary content XML
+/// and strip tags to produce text suitable for LLM consumption.
+fn extract_office_text(media_type: &str, data: &[u8]) -> Option<String> {
+    use std::io::Read;
+
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut text = String::new();
+
+    match media_type {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            if let Ok(mut file) = archive.by_name("word/document.xml") {
+                let mut content = String::new();
+                if file.read_to_string(&mut content).is_ok() {
+                    text.push_str(&strip_xml_tags(&content));
+                }
+            }
+        }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            if let Ok(mut file) = archive.by_name("xl/sharedStrings.xml") {
+                let mut content = String::new();
+                if file.read_to_string(&mut content).is_ok() {
+                    text.push_str(&strip_xml_tags(&content));
+                    text.push('\n');
+                }
+            }
+            if let Ok(mut file) = archive.by_name("xl/worksheets/sheet1.xml") {
+                let mut content = String::new();
+                if file.read_to_string(&mut content).is_ok() {
+                    text.push_str(&strip_xml_tags(&content));
+                }
+            }
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            let slide_names: Vec<String> = (0..archive.len())
+                .filter_map(|i| {
+                    let name = archive.by_index(i).ok()?.name().to_string();
+                    if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut sorted = slide_names;
+            sorted.sort();
+            for name in sorted {
+                if let Ok(mut file) = archive.by_name(&name) {
+                    let mut content = String::new();
+                    if file.read_to_string(&mut content).is_ok() {
+                        text.push_str(&strip_xml_tags(&content));
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Strip XML tags from a string, collapsing whitespace.
+fn strip_xml_tags(xml: &str) -> String {
+    let mut result = String::with_capacity(xml.len() / 2);
+    let mut in_tag = false;
+    for c in xml.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                result.push(' ');
+            }
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Returns true if the content type is supported as an attachment block.
+///
+/// Office Open XML types are accepted here and converted to text/plain at runtime
+/// by `extract_office_text()`. Legacy binary Office formats (.doc/.xls/.ppt) are
+/// not supported as they use CFB format which cannot be parsed with the zip crate.
 fn is_supported_attachment_type(content_type: &str) -> bool {
-    content_type.starts_with("image/")
-        || content_type.starts_with("text/")
-        || content_type == "application/pdf"
+    if content_type.starts_with("image/") || content_type.starts_with("text/") {
+        return true;
+    }
+    matches!(
+        content_type,
+        "application/pdf"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/json"
+            | "application/csv"
+    )
 }
 
 /// Pre-insert image attachments into an agent's session so the LLM can see them.
