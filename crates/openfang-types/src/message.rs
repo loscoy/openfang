@@ -56,6 +56,14 @@ pub enum ContentBlock {
         /// Base64-encoded image data.
         data: String,
     },
+    /// An inline base64-encoded document (PDF, plain text, CSV, etc.).
+    #[serde(rename = "document")]
+    Document {
+        /// MIME type (e.g. "application/pdf", "text/plain").
+        media_type: String,
+        /// Base64-encoded document data.
+        data: String,
+    },
     /// A tool use request from the assistant.
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -145,7 +153,9 @@ impl MessageContent {
                     ContentBlock::ToolUse { name, input, .. } => {
                         name.len() + input.to_string().len()
                     }
-                    ContentBlock::Image { .. } | ContentBlock::Unknown => 0,
+                    ContentBlock::Image { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::Unknown => 0,
                 })
                 .sum(),
         }

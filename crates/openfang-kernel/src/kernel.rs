@@ -2039,6 +2039,7 @@ impl OpenFangKernel {
         } else {
             message.to_string()
         };
+        let content_blocks_owned = content_blocks;
         let kernel_clone = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
@@ -2114,7 +2115,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
-                content_blocks,
+                content_blocks_owned,
             )
             .await;
 

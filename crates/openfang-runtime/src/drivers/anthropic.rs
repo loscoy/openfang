@@ -70,7 +70,9 @@ enum ApiContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { source: ApiImageSource },
+    Image { source: ApiMediaSource },
+    #[serde(rename = "document")]
+    Document { source: ApiMediaSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -87,7 +89,7 @@ enum ApiContentBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiImageSource {
+struct ApiMediaSource {
     #[serde(rename = "type")]
     source_type: String,
     media_type: String,
@@ -592,12 +594,21 @@ fn convert_message(msg: &Message) -> ApiMessage {
                         Some(ApiContentBlock::Text { text: text.clone() })
                     }
                     ContentBlock::Image { media_type, data } => Some(ApiContentBlock::Image {
-                        source: ApiImageSource {
+                        source: ApiMediaSource {
                             source_type: "base64".to_string(),
                             media_type: media_type.clone(),
                             data: data.clone(),
                         },
                     }),
+                    ContentBlock::Document { media_type, data } => {
+                        Some(ApiContentBlock::Document {
+                            source: ApiMediaSource {
+                                source_type: "base64".to_string(),
+                                media_type: media_type.clone(),
+                                data: data.clone(),
+                            },
+                        })
+                    }
                     ContentBlock::ToolUse {
                         id, name, input, ..
                     } => Some(ApiContentBlock::ToolUse {

@@ -371,6 +371,22 @@ impl LlmDriver for OpenAIDriver {
                                     },
                                 });
                             }
+                            ContentBlock::Document { media_type, data } => {
+                                // For text-based documents, decode base64 and embed as text.
+                                // OpenAI-compatible APIs don't have a native document block;
+                                // this ensures the model can read the file content.
+                                if media_type.starts_with("text/") || media_type == "application/pdf" {
+                                    use base64::Engine;
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                                        if let Ok(text) = String::from_utf8(bytes) {
+                                            let label = media_type.split('/').last().unwrap_or("document");
+                                            parts.push(OaiContentPart::Text {
+                                                text: format!("[{label} file content]\n{text}"),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             ContentBlock::Thinking { .. } => {}
                             _ => {}
                         }

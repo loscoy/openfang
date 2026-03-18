@@ -403,6 +403,9 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                         ContentBlock::Image { media_type, .. } => {
                             conversation_text.push_str(&format!("[Image: {media_type}]\n\n"));
                         }
+                        ContentBlock::Document { media_type, .. } => {
+                            conversation_text.push_str(&format!("[Document: {media_type}]\n\n"));
+                        }
                         ContentBlock::Thinking { .. } => {}
                         ContentBlock::Unknown => {}
                     }

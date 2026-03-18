@@ -25,13 +25,17 @@ pub struct SpawnResponse {
     pub name: String,
 }
 
-/// A file attachment reference (from a prior upload).
+/// A file attachment: either `file_id` (prior upload) or inline Base64 `data`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttachmentRef {
+    #[serde(default)]
     pub file_id: String,
+    /// Raw file bytes as standard Base64 (YOLOX / clients that skip upload).
+    #[serde(default)]
+    pub data: String,
     #[serde(default)]
     pub filename: String,
-    #[serde(default)]
+    #[serde(default, alias = "contentType")]
     pub content_type: String,
 }
 

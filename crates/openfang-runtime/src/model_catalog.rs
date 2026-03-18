@@ -184,6 +184,10 @@ impl ModelCatalog {
         if let Some(canonical) = self.aliases.get(&lower) {
             return self.models.iter().find(|m| m.id == *canonical);
         }
+        // Strip "provider/" prefix (e.g. "openai/gpt-4o" → "gpt-4o") and retry
+        if let Some(model_part) = id_or_alias.splitn(2, '/').nth(1) {
+            return self.find_model(model_part);
+        }
         None
     }
 

@@ -241,55 +241,108 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(agents)
 }
 
-/// Resolve uploaded file attachments into ContentBlock::Image blocks.
+/// Resolve uploaded file attachments into content blocks (Image or Document).
 ///
-/// Reads each file from the upload directory, base64-encodes it, and
-/// returns image content blocks ready to insert into a session message.
+/// Supported content types:
+/// - `image/*`           → `ContentBlock::Image`
+/// - `application/pdf`   → `ContentBlock::Document`
+/// - `text/*`            → `ContentBlock::Document`
 pub fn resolve_attachments(
     attachments: &[AttachmentRef],
 ) -> Vec<openfang_types::message::ContentBlock> {
     use base64::Engine;
+    use openfang_types::message::ContentBlock;
 
     let upload_dir = std::env::temp_dir().join("openfang_uploads");
     let mut blocks = Vec::new();
 
     for att in attachments {
-        // Look up metadata from the upload registry
-        let meta = UPLOAD_REGISTRY.get(&att.file_id);
-        let content_type = if let Some(ref m) = meta {
-            m.content_type.clone()
-        } else if !att.content_type.is_empty() {
-            att.content_type.clone()
+        let data_b64 = if !att.data.trim().is_empty() {
+            // Inline Base64 (e.g. YOLOX WebSocket → no prior upload)
+            let ct = att.content_type.trim();
+            if ct.is_empty() {
+                continue;
+            }
+            let cleaned: String = att
+                .data
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            match base64::engine::general_purpose::STANDARD.decode(&cleaned) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Invalid base64 in inline attachment");
+                    continue;
+                }
+            }
         } else {
-            continue; // Skip unknown attachments
+            // Look up metadata from the upload registry
+            let meta = UPLOAD_REGISTRY.get(&att.file_id);
+            let content_type = if let Some(ref m) = meta {
+                m.content_type.clone()
+            } else if !att.content_type.is_empty() {
+                att.content_type.clone()
+            } else {
+                continue;
+            };
+
+            if !is_supported_attachment_type(&content_type) {
+                continue;
+            }
+
+            if uuid::Uuid::parse_str(&att.file_id).is_err() {
+                continue;
+            }
+
+            let file_path = upload_dir.join(&att.file_id);
+            match std::fs::read(&file_path) {
+                Ok(data) => base64::engine::general_purpose::STANDARD.encode(&data),
+                Err(e) => {
+                    tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read upload for attachment");
+                    continue;
+                }
+            }
         };
 
-        // Only process image types
-        if !content_type.starts_with("image/") {
+        let media_type = if !att.data.trim().is_empty() {
+            att.content_type.trim().to_string()
+        } else {
+            let meta = UPLOAD_REGISTRY.get(&att.file_id);
+            if let Some(ref m) = meta {
+                m.content_type.clone()
+            } else {
+                att.content_type.clone()
+            }
+        };
+
+        if !is_supported_attachment_type(&media_type) {
             continue;
         }
 
-        // Validate file_id is a UUID to prevent path traversal
-        if uuid::Uuid::parse_str(&att.file_id).is_err() {
-            continue;
-        }
-
-        let file_path = upload_dir.join(&att.file_id);
-        match std::fs::read(&file_path) {
-            Ok(data) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                blocks.push(openfang_types::message::ContentBlock::Image {
-                    media_type: content_type,
-                    data: b64,
-                });
-            }
-            Err(e) => {
-                tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read upload for attachment");
-            }
+        if media_type.starts_with("image/") {
+            blocks.push(ContentBlock::Image {
+                media_type,
+                data: data_b64,
+            });
+        } else {
+            blocks.push(ContentBlock::Document {
+                media_type,
+                data: data_b64,
+            });
         }
     }
 
     blocks
+}
+
+/// Returns true if the content type is supported as an attachment block.
+fn is_supported_attachment_type(content_type: &str) -> bool {
+    content_type.starts_with("image/")
+        || content_type.starts_with("text/")
+        || content_type == "application/pdf"
 }
 
 /// Pre-insert image attachments into an agent's session so the LLM can see them.
@@ -362,16 +415,10 @@ pub async fn send_message(
         );
     }
 
-    // Resolve file attachments into image content blocks.
-    // Pass them as content_blocks so the LLM receives them in the current turn
-    // (not as a separate session message which the LLM may not process).
+    // Resolve file attachments into content blocks and send as a single multimodal message.
     let content_blocks = if !req.attachments.is_empty() {
-        let image_blocks = resolve_attachments(&req.attachments);
-        if image_blocks.is_empty() {
-            None
-        } else {
-            Some(image_blocks)
-        }
+        let blocks = resolve_attachments(&req.attachments);
+        if blocks.is_empty() { None } else { Some(blocks) }
     } else {
         None
     };
@@ -1464,6 +1511,16 @@ pub async fn send_message_stream(
             .into_response();
     }
 
+    // Resolve file attachments into content blocks and pass directly to the streaming kernel.
+    // This avoids the fragile two-message pattern (inject_attachments_into_session) and sends
+    // text + image in a single user message, which is what LLM providers expect.
+    let content_blocks = if !req.attachments.is_empty() {
+        let blocks = resolve_attachments(&req.attachments);
+        if blocks.is_empty() { None } else { Some(blocks) }
+    } else {
+        None
+    };
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     let (rx, _handle) = match state.kernel.send_message_streaming(
         agent_id,
@@ -1471,7 +1528,7 @@ pub async fn send_message_stream(
         Some(kernel_handle),
         req.sender_id,
         req.sender_name,
-        None, // SSE streaming doesn't support image attachments yet
+        content_blocks,
     ) {
         Ok(pair) => pair,
         Err(e) => {

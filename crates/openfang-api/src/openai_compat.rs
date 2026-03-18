@@ -266,14 +266,25 @@ pub async fn chat_completions(
 
     // Extract the last user message as the input
     let messages = convert_messages(&req.messages);
-    let last_user_msg = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
+    let last_user_msg_entry = messages.iter().rev().find(|m| m.role == Role::User);
+    let last_user_msg = last_user_msg_entry
         .map(|m| m.content.text_content())
         .unwrap_or_default();
 
-    if last_user_msg.is_empty() {
+    // Extract content blocks (text + images) from the last user message for multimodal support.
+    let content_blocks: Option<Vec<ContentBlock>> = last_user_msg_entry.and_then(|m| {
+        if let MessageContent::Blocks(blocks) = &m.content {
+            if blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::Document { .. }))
+            {
+                return Some(blocks.clone());
+            }
+        }
+        None
+    });
+
+    if last_user_msg.is_empty() && content_blocks.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -300,6 +311,7 @@ pub async fn chat_completions(
             agent_id,
             agent_name,
             &last_user_msg,
+            content_blocks,
             request_id,
             created,
         )
@@ -319,13 +331,17 @@ pub async fn chat_completions(
         };
     }
 
-    // Non-streaming response
-    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
-        .kernel
-        .send_message_with_handle(agent_id, &last_user_msg, Some(kernel_handle), None, None)
-        .await
-    {
+    // Non-streaming response: use send_message_with_blocks when image content is present.
+    let kernel_result = if let Some(blocks) = content_blocks {
+        state.kernel.send_message_with_blocks(agent_id, &last_user_msg, blocks).await
+    } else {
+        let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+        state
+            .kernel
+            .send_message_with_handle(agent_id, &last_user_msg, Some(kernel_handle), None, None)
+            .await
+    };
+    match kernel_result {
         Ok(result) => {
             let response = ChatCompletionResponse {
                 id: request_id,
@@ -372,6 +388,7 @@ async fn stream_response(
     agent_id: AgentId,
     agent_name: String,
     message: &str,
+    content_blocks: Option<Vec<ContentBlock>>,
     request_id: String,
     created: u64,
 ) -> Result<axum::response::Response, String> {
@@ -379,7 +396,14 @@ async fn stream_response(
 
     let (mut rx, _handle) = state
         .kernel
-        .send_message_streaming(agent_id, message, Some(kernel_handle), None, None, None)
+        .send_message_streaming(
+            agent_id,
+            message,
+            Some(kernel_handle),
+            None,
+            None,
+            content_blocks,
+        )
         .map_err(|e| format!("Streaming setup failed: {e}"))?;
 
     let (tx, stream_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
