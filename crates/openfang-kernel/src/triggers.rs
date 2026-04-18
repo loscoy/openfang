@@ -453,6 +453,18 @@ fn describe_event(event: &Event) -> String {
         EventPayload::Custom(data) => {
             format!("Custom event ({} bytes)", data.len())
         }
+        EventPayload::CronResponse {
+            job_id,
+            job_name,
+            response,
+            ..
+        } => {
+            format!(
+                "Cron '{}' ({job_id}) completed: {}",
+                job_name,
+                openfang_types::truncate_str(response, 200)
+            )
+        }
     }
 }
 

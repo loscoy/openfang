@@ -146,4 +146,41 @@ mod tests {
             _ => panic!("Wrong payload"),
         }
     }
+
+    #[tokio::test]
+    async fn test_cron_response_routed_to_agent_subscriber() {
+        use openfang_types::event::{EventPayload, EventTarget};
+        use openfang_types::scheduler::CronJobId;
+
+        let bus = EventBus::new();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut rx = bus.subscribe_agent(agent_id);
+
+        let event = Event::new(
+            agent_id,
+            EventTarget::Agent(agent_id),
+            EventPayload::CronResponse {
+                job_id: CronJobId::new(),
+                job_name: "test-job".to_string(),
+                response: "hello from cron".to_string(),
+                timestamp: chrono::Utc::now(),
+            },
+        );
+        bus.publish(event).await;
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for event")
+        .expect("channel closed");
+
+        match received.payload {
+            EventPayload::CronResponse { response, .. } => {
+                assert_eq!(response, "hello from cron");
+            }
+            other => panic!("expected CronResponse, got {other:?}"),
+        }
+    }
 }

@@ -5723,6 +5723,18 @@ impl OpenFangKernel {
                         {
                             Ok(()) => {
                                 self.cron_scheduler.record_success(job_id);
+                                // Deliver to active WS subscribers — fire-and-forget, does not affect delivery result.
+                                let cron_event = Event::new(
+                                    agent_id,
+                                    EventTarget::Agent(agent_id),
+                                    EventPayload::CronResponse {
+                                        job_id,
+                                        job_name: job_name.clone(),
+                                        response: result.response.clone(),
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                );
+                                let _ = self.publish_event(cron_event).await;
                                 Ok(result.response)
                             }
                             Err(e) => {
@@ -5772,6 +5784,18 @@ impl OpenFangKernel {
                         match cron_deliver_response(self, agent_id, &output, &delivery).await {
                             Ok(()) => {
                                 self.cron_scheduler.record_success(job_id);
+                                // Deliver to active WS subscribers — fire-and-forget, does not affect delivery result.
+                                let cron_event = Event::new(
+                                    agent_id,
+                                    EventTarget::Agent(agent_id),
+                                    EventPayload::CronResponse {
+                                        job_id,
+                                        job_name: job_name.clone(),
+                                        response: output.clone(),
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                );
+                                let _ = self.publish_event(cron_event).await;
                                 Ok(output)
                             }
                             Err(e) => {
@@ -7085,6 +7109,39 @@ mod tests {
             entry.manifest.tool_blocklist.is_empty(),
             "hand activation should not set a runtime blocklist by default"
         );
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_publish_cron_response_appears_in_event_history() {
+        use openfang_types::event::{EventPayload, EventTarget};
+        use openfang_types::scheduler::CronJobId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-cron-history-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boot");
+        let agent_id = AgentId::new();
+        let event = Event::new(
+            agent_id,
+            EventTarget::Agent(agent_id),
+            EventPayload::CronResponse {
+                job_id: CronJobId::new(),
+                job_name: "history-smoke".to_string(),
+                response: "ok".to_string(),
+                timestamp: chrono::Utc::now(),
+            },
+        );
+        let _ = kernel.publish_event(event).await;
+        let history = kernel.event_bus.history(10).await;
+        assert!(history.iter().any(|e| matches!(e.payload, EventPayload::CronResponse { .. })));
 
         kernel.shutdown();
     }
