@@ -11,6 +11,8 @@
 //! Server → Client: `{"type":"agents_updated","agents":[...]}`
 //! Server → Client: `{"type":"silent_complete"}` (agent chose NO_REPLY)
 //! Server → Client: `{"type":"canvas","canvas_id":"...","html":"...","title":"..."}`
+//! Server → Client: `{"type":"response","content":"...","meta":{"source":"cron","job_id":"...","job_name":"...","timestamp":"..."}}`
+//!   ↑ only present when cron job fires; meta.source="cron" distinguishes from interactive responses
 
 use crate::routes::AppState;
 use axum::extract::ws::{Message, WebSocket};
@@ -312,6 +314,50 @@ async fn handle_agent_ws(
         }
     });
 
+    // Background task: forward CronResponse events to this WS client in real-time.
+    // subscribe_agent() lazily creates a per-agent broadcast::Sender in a DashMap keyed by AgentId.
+    // The DashMap entry persists after WS disconnect (cleaned up only on agent deletion), but
+    // this is safe: the entry is bounded to one per agent, and a Sender with no receivers
+    // silently drops events.
+    let mut cron_rx = state.kernel.event_bus.subscribe_agent(agent_id);
+    let sender_cron = Arc::clone(&sender);
+    let cron_handle = tokio::spawn(async move {
+        loop {
+            match cron_rx.recv().await {
+                Ok(event) => {
+                    if let openfang_types::event::EventPayload::CronResponse {
+                        job_id,
+                        job_name,
+                        response,
+                        timestamp,
+                    } = event.payload
+                    {
+                        let msg = serde_json::json!({
+                            "type": "response",
+                            "content": response,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "iterations": 0,
+                            "cost_usd": null,
+                            "context_pressure": "low",
+                            "meta": {
+                                "source": "cron",
+                                "job_id": job_id.to_string(),
+                                "job_name": job_name,
+                                "timestamp": timestamp.to_rfc3339(),
+                            }
+                        });
+                        if send_json(&sender_cron, &msg).await.is_err() {
+                            break; // WS closed
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     // Per-connection rate limiting: max 10 messages per 60 seconds
     let mut msg_times: Vec<std::time::Instant> = Vec::new();
     const MAX_PER_MIN: usize = 10;
@@ -401,6 +447,7 @@ async fn handle_agent_ws(
 
     // Cleanup
     update_handle.abort();
+    cron_handle.abort();
     info!(agent_id = %id_str, "WebSocket disconnected");
 }
 
