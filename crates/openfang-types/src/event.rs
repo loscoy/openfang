@@ -84,6 +84,18 @@ pub enum EventPayload {
     System(SystemEvent),
     /// User-defined payload.
     Custom(Vec<u8>),
+    /// Cron job completed — delivered to active WebSocket subscribers for this agent.
+    /// Note: CronAction::SystemEvent does not produce a CronResponse (no agent turn occurs).
+    CronResponse {
+        /// The cron job that fired.
+        job_id: crate::scheduler::CronJobId,
+        /// Human-readable job name.
+        job_name: String,
+        /// The agent's full response text.
+        response: String,
+        /// When the cron job completed.
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// A message between agents or from user to agent.
@@ -387,5 +399,30 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.ttl, Some(Duration::from_millis(60_000)));
+    }
+
+    #[test]
+    fn test_cron_response_event_roundtrip() {
+        use crate::scheduler::CronJobId;
+        let agent_id = AgentId::new();
+        let job_id = CronJobId::new();
+        let event = Event::new(
+            agent_id,
+            EventTarget::Agent(agent_id),
+            EventPayload::CronResponse {
+                job_id,
+                job_name: "daily-report".to_string(),
+                response: "Report done.".to_string(),
+                timestamp: chrono::Utc::now(),
+            },
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("CronResponse"), "serde tag missing: {json}");
+        assert!(json.contains("daily-report"), "job_name missing: {json}");
+        let de: Event = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(de.payload, EventPayload::CronResponse { .. }),
+            "wrong payload variant after deserialize"
+        );
     }
 }
