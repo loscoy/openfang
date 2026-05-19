@@ -55,6 +55,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_channels::wecom::WeComAdapter;
 use openfang_kernel::OpenFangKernel;
+use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_types::agent::AgentId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -523,6 +524,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         timeout_secs: None,
                     },
                     delivery: openfang_types::scheduler::CronDelivery::None,
+                    delivery_targets: Vec::new(),
                     created_at: chrono::Utc::now(),
                     last_run: None,
                     next_run: None,
@@ -893,6 +895,23 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
     }
 
+    async fn send_channel_message(
+        &self,
+        channel_type: &str,
+        recipient: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        <OpenFangKernel as KernelHandle>::send_channel_message(
+            &self.kernel,
+            channel_type,
+            recipient,
+            message,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn check_auto_reply(&self, agent_id: AgentId, message: &str) -> Option<String> {
         // Check if auto-reply should fire for this message
         let channel_type = "bridge"; // Generic; the bridge layer handles specifics
@@ -1147,11 +1166,12 @@ pub async fn start_channel_bridge_with_config(
     if let Some(ref tg_config) = config.telegram {
         if let Some(token) = read_token(&tg_config.bot_token_env, "Telegram") {
             let poll_interval = Duration::from_secs(tg_config.poll_interval_secs);
-            let adapter = Arc::new(TelegramAdapter::new(
+            let adapter = Arc::new(TelegramAdapter::with_thread_routes(
                 token,
                 tg_config.allowed_users.clone(),
                 poll_interval,
                 tg_config.api_url.clone(),
+                tg_config.thread_routes.clone(),
             ));
             adapters.push((adapter, tg_config.default_agent.clone()));
         }
@@ -1166,6 +1186,7 @@ pub async fn start_channel_bridge_with_config(
                 dc_config.allowed_users.clone(),
                 dc_config.ignore_bots,
                 dc_config.intents,
+                dc_config.auto_thread.clone(),
             ));
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
@@ -1230,10 +1251,17 @@ pub async fn start_channel_bridge_with_config(
     // Matrix
     if let Some(ref mx_config) = config.matrix {
         if let Some(token) = read_token(&mx_config.access_token_env, "Matrix") {
-            let adapter = Arc::new(MatrixAdapter::new(
+            // MSC2918 refresh-token support: optional env var, when present the
+            // adapter auto-recovers from M_UNKNOWN_TOKEN 401s.
+            let refresh = mx_config
+                .refresh_token_env
+                .as_deref()
+                .and_then(|env| read_token(env, "Matrix refresh"));
+            let adapter = Arc::new(MatrixAdapter::with_refresh_token(
                 mx_config.homeserver_url.clone(),
                 mx_config.user_id.clone(),
                 token,
+                refresh,
                 mx_config.allowed_rooms.clone(),
                 mx_config.auto_accept_invites,
             ));
@@ -1458,9 +1486,10 @@ pub async fn start_channel_bridge_with_config(
                     encrypt_key,
                     fs_config.bot_names.clone(),
                 )),
-                FeishuMode::Websocket => Arc::new(FeishuAdapter::new_websocket(
+                FeishuMode::Websocket => Arc::new(FeishuAdapter::new_websocket_with_region(
                     fs_config.app_id.clone(),
                     secret,
+                    region,
                 )),
             };
             adapters.push((adapter, fs_config.default_agent.clone()));

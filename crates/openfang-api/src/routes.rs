@@ -6,7 +6,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
-use openfang_channels::bridge::channel_command_specs;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
@@ -216,6 +215,12 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
             let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
                 && auth_status != "missing";
 
+            // Issue #1026: surface which agents are currently calling the LLM
+            // so the dashboard can render a live "inferencing" indicator.
+            // A running task in the kernel's `running_tasks` map means the
+            // agent loop is in flight (LLM call + tool dispatch).
+            let is_inferencing = state.kernel.running_tasks.contains_key(&e.id);
+
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
@@ -228,6 +233,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "model_tier": tier,
                 "auth_status": auth_status,
                 "ready": ready,
+                "is_inferencing": is_inferencing,
                 "profile": e.manifest.profile,
                 "identity": {
                     "emoji": e.identity.emoji,
@@ -515,6 +521,7 @@ pub fn inject_attachments_into_session(
     session.messages.push(Message {
         role: Role::User,
         content: MessageContent::Blocks(image_blocks),
+        ..Default::default()
     });
 
     if let Err(e) = kernel.memory.save_session(&session) {
@@ -870,6 +877,98 @@ pub async fn kill_agent(
             )
         }
     }
+}
+
+/// DELETE /api/agents/{id}/uninstall — Permanently uninstall an agent.
+///
+/// Issue #1163: in addition to killing the agent (registry + memory + cron),
+/// this also removes the on-disk `~/.openfang/agents/<name>/` directory so
+/// the agent does not auto-respawn on the next daemon start.
+pub async fn uninstall_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Capture the agent name BEFORE killing — registry entry is gone after.
+    let agent_name = match state.kernel.registry.get(agent_id) {
+        Some(entry) => entry.name.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    };
+
+    // Step 1: kill the agent (registry, memory, cron, triggers, caps).
+    if let Err(e) = state.kernel.kill_agent(agent_id) {
+        tracing::warn!("kill_agent failed during uninstall for {id}: {e}");
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found or already terminated"})),
+        );
+    }
+
+    // Step 2: remove ~/.openfang/agents/<name>/ so the agent does NOT
+    // auto-respawn from disk on the next daemon start.
+    let agents_dir = state.kernel.config.home_dir.join("agents");
+    let agent_dir = agents_dir.join(&agent_name);
+
+    let dir_removed = if agent_dir.is_dir() {
+        // Safety: only allow removal if the parent is exactly the agents root.
+        let parent_ok = agent_dir
+            .parent()
+            .map(|p| p == agents_dir.as_path())
+            .unwrap_or(false);
+        if !parent_ok {
+            tracing::warn!(
+                agent = %agent_name,
+                path = %agent_dir.display(),
+                "Refusing to remove agent dir outside agents root"
+            );
+            false
+        } else {
+            match std::fs::remove_dir_all(&agent_dir) {
+                Ok(()) => {
+                    tracing::info!(
+                        agent = %agent_name,
+                        path = %agent_dir.display(),
+                        "Removed agent directory on uninstall (#1163)"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_name,
+                        path = %agent_dir.display(),
+                        "Failed to remove agent directory: {e}"
+                    );
+                    false
+                }
+            }
+        }
+    } else {
+        false
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "uninstalled",
+            "agent_id": id,
+            "name": agent_name,
+            "dir_removed": dir_removed,
+        })),
+    )
 }
 
 /// POST /api/agents/{id}/restart — Restart a crashed/stuck agent.
@@ -1597,11 +1696,15 @@ pub async fn get_agent(
                 "network": entry.manifest.capabilities.network,
             },
             "description": entry.manifest.description,
+            "system_prompt": entry.manifest.model.system_prompt,
             "tags": entry.manifest.tags,
             "identity": {
                 "emoji": entry.identity.emoji,
                 "avatar_url": entry.identity.avatar_url,
                 "color": entry.identity.color,
+                "archetype": entry.identity.archetype,
+                "vibe": entry.identity.vibe,
+                "greeting_style": entry.identity.greeting_style,
             },
             "skills": entry.manifest.skills,
             "skills_mode": if entry.manifest.skills.is_empty() { "all" } else { "allowlist" },
@@ -3709,6 +3812,21 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
     let _ = registry.load_all();
 
+    // Snapshot of user-provided overrides for the `config_resolved_count`.
+    // Matches `reload_skills()` fallback order so the count reflects what
+    // agents will actually see.
+    let user_configs = {
+        let override_guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        override_guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+
     let skills: Vec<serde_json::Value> = registry
         .list()
         .iter()
@@ -3727,6 +3845,32 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                     serde_json::json!({"type": "local"})
                 }
             };
+
+            // Count how many declared config vars resolve to any source
+            // (user override → env → default). Does NOT fetch secret values;
+            // it only checks presence. Zero-length map → 0/0.
+            let declared = &s.manifest.config;
+            let skill_user_cfg = user_configs.get(&s.manifest.skill.name);
+            let mut resolved = 0usize;
+            for (name, var) in declared.iter() {
+                if skill_user_cfg.and_then(|m| m.get(name)).is_some() {
+                    resolved += 1;
+                    continue;
+                }
+                if let Some(env_name) = var.env.as_ref() {
+                    if std::env::var(env_name)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                    {
+                        resolved += 1;
+                        continue;
+                    }
+                }
+                if var.default.as_ref().is_some_and(|d| !d.is_empty()) {
+                    resolved += 1;
+                }
+            }
+
             serde_json::json!({
                 "name": s.manifest.skill.name,
                 "description": s.manifest.skill.description,
@@ -3738,6 +3882,8 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "enabled": s.enabled,
                 "source": source,
                 "has_prompt_context": s.manifest.prompt_context.is_some(),
+                "config_declared_count": declared.len(),
+                "config_resolved_count": resolved,
             })
         })
         .collect();
@@ -3754,7 +3900,14 @@ pub async fn install_skill(
     let config = openfang_skills::marketplace::MarketplaceConfig::default();
     let client = openfang_skills::marketplace::MarketplaceClient::new(config);
 
-    match client.install(&req.name, &skills_dir).await {
+    let opts = openfang_skills::installer::InstallOptions {
+        require_signed: req.require_signed,
+        allowed_signer_keys: req.allowed_signer_keys.clone(),
+    };
+    match client
+        .install_with_options(&req.name, &skills_dir, &opts)
+        .await
+    {
         Ok(version) => {
             // Hot-reload so agents see the new skill immediately
             state.kernel.reload_skills();
@@ -3809,6 +3962,112 @@ pub async fn uninstall_skill(
 pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.kernel.reload_skills();
     Json(serde_json::json!({"status": "reloaded"}))
+}
+
+/// POST /api/audit/append — Append an entry to the Merkle hash chain audit
+/// trail on behalf of an external (instance-side) wrapper (issue #1174).
+///
+/// RBAC: gated by the same bearer-token middleware as POST /api/skills/install
+/// (see `middleware::auth_middleware`). When `api_key` is configured every
+/// caller must present `Authorization: Bearer <key>` — wrappers running in the
+/// same trust boundary as the daemon are expected to share that key.
+pub async fn audit_append(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AuditAppendRequest>,
+) -> impl IntoResponse {
+    use openfang_runtime::audit::AuditAction;
+
+    // SECURITY: bound input sizes so a wrapper cannot wedge the chain with
+    // unbounded strings. The audit table stores TEXT columns and the chain
+    // hash is computed over the same bytes — keep it sane.
+    const MAX_FIELD: usize = 16 * 1024;
+    if req.event_type.len() > MAX_FIELD
+        || req.agent_id.len() > MAX_FIELD
+        || req.detail.len() > MAX_FIELD
+        || req
+            .outcome
+            .as_ref()
+            .map(|s| s.len() > MAX_FIELD)
+            .unwrap_or(false)
+        || req
+            .signing_context
+            .as_ref()
+            .map(|s| s.len() > MAX_FIELD)
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "field exceeds 16KB limit"})),
+        );
+    }
+
+    // Map operator-supplied event_type → AuditAction (case-insensitive).
+    let action = match req.event_type.trim().to_ascii_lowercase().as_str() {
+        "toolinvoke" | "tool_invoke" | "tool" => AuditAction::ToolInvoke,
+        "capabilitycheck" | "capability_check" | "capability" => AuditAction::CapabilityCheck,
+        "agentspawn" | "agent_spawn" | "spawn" => AuditAction::AgentSpawn,
+        "agentkill" | "agent_kill" | "kill" => AuditAction::AgentKill,
+        "agentmessage" | "agent_message" | "message" => AuditAction::AgentMessage,
+        "memoryaccess" | "memory_access" | "memory" => AuditAction::MemoryAccess,
+        "fileaccess" | "file_access" | "file" => AuditAction::FileAccess,
+        "networkaccess" | "network_access" | "network" => AuditAction::NetworkAccess,
+        "shellexec" | "shell_exec" | "shell" => AuditAction::ShellExec,
+        "authattempt" | "auth_attempt" | "auth" => AuditAction::AuthAttempt,
+        "wireconnect" | "wire_connect" | "wire" => AuditAction::WireConnect,
+        "configchange" | "config_change" | "config" => AuditAction::ConfigChange,
+        other => {
+            tracing::warn!(
+                "audit_append: unknown event_type {other:?}, falling back to ToolInvoke"
+            );
+            AuditAction::ToolInvoke
+        }
+    };
+
+    // Compose a detail string that preserves the operator's free-form detail
+    // plus optional signing context and structured payload, so wrappers can
+    // attach context without changing the on-chain schema.
+    let mut detail = req.detail.clone();
+    if let Some(ctx) = req.signing_context.as_ref().filter(|s| !s.is_empty()) {
+        if !detail.is_empty() {
+            detail.push_str(" | ");
+        }
+        detail.push_str("signer=");
+        detail.push_str(ctx);
+    }
+    if let Some(payload) = req.payload.as_ref() {
+        let serialised = serde_json::to_string(payload)
+            .unwrap_or_else(|_| String::from("<unserialisable payload>"));
+        // Cap payload contribution so a huge JSON blob cannot blow the entry.
+        let truncated: String = serialised.chars().take(8 * 1024).collect();
+        if !detail.is_empty() {
+            detail.push_str(" | ");
+        }
+        detail.push_str("payload=");
+        detail.push_str(&truncated);
+    }
+
+    let agent_id = if req.agent_id.trim().is_empty() {
+        "external-wrapper".to_string()
+    } else {
+        req.agent_id.clone()
+    };
+    let outcome = req.outcome.clone().unwrap_or_else(|| "ok".to_string());
+
+    let hash = state
+        .kernel
+        .audit_log
+        .record(agent_id, action, detail, outcome);
+    let seq = state.kernel.audit_log.len().saturating_sub(1) as u64;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "appended",
+            "seq": seq,
+            "hash": hash,
+            "tip": state.kernel.audit_log.tip_hash(),
+        })),
+    )
 }
 
 /// GET /api/marketplace/search — Search the FangHub marketplace.
@@ -6442,7 +6701,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     // Index probe results by provider list position for O(1) lookup
     let mut probe_map: HashMap<usize, openfang_runtime::provider_health::ProbeResult> =
         HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results.into_iter()) {
+    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -7224,6 +7483,10 @@ pub async fn compact_session(
 }
 
 /// POST /api/agents/{id}/stop — Cancel an agent's current LLM run.
+///
+/// If the agent is owned by an active hand instance, the hand instance is
+/// also deactivated. Otherwise the hand stays registered as `Active` and the
+/// user cannot re-activate it via the wizard (issue #1164).
 pub async fn stop_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -7237,6 +7500,33 @@ pub async fn stop_agent(
             )
         }
     };
+
+    // If this agent is the agent of an active hand instance, deactivate the
+    // hand entirely — which also kills the agent and cancels the run. This
+    // matches what users expect when they click Stop on a hand-owned agent.
+    if let Some(instance) = state.kernel.hand_registry.find_by_agent(agent_id) {
+        match state.kernel.deactivate_hand(instance.instance_id) {
+            Ok(()) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "message": "Hand deactivated",
+                        "hand_deactivated": true,
+                        "hand_id": instance.hand_id,
+                        "instance_id": instance.instance_id,
+                    })),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{e}")})),
+                );
+            }
+        }
+    }
+
     match state.kernel.stop_agent_run(agent_id) {
         Ok(true) => (
             StatusCode::OK,
@@ -7686,6 +7976,7 @@ pub async fn set_provider_key(
                     model: model_id,
                     api_key_env: env_var.clone(),
                     base_url: None,
+                    subprocess_timeout_secs: None,
                 };
                 let mut guard = state
                     .kernel
@@ -7853,6 +8144,7 @@ pub async fn test_provider(
             Some(base_url)
         },
         skip_permissions: true,
+        subprocess_timeout_secs: None,
     };
 
     match openfang_runtime::drivers::create_driver(&driver_config) {
@@ -8090,6 +8382,516 @@ pub async fn create_skill(
             "note": "Restart the daemon to load the new skill, or it will be available on next boot."
         })),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Skill config endpoints
+// ---------------------------------------------------------------------------
+//
+// These endpoints expose per-skill runtime variables declared in the skill's
+// SKILL.md frontmatter `config:` section. Resolution order is:
+//
+//   1. user config         (the `[skills.<name>]` section in config.toml)
+//   2. env var              (`var.env`)
+//   3. default              (`var.default`)
+//
+// The GET endpoint always returns secret-looking values redacted. The PUT
+// endpoint atomically rewrites the `[skills.<name>]` section of config.toml
+// and reloads the skill registry so the change takes effect on the next
+// prompt build.
+
+/// Load a skill's declared `config:` map, even if `required` vars are
+/// currently unresolved.
+///
+/// Looking up the live registry doesn't work here because the registry's
+/// load path refuses to insert a skill whose required config var has no
+/// resolvable value — which is exactly the state the user needs to reach
+/// this UI to fix. Instead we read the manifest straight from disk (for
+/// user-installed / workspace skills) or straight from the compile-time
+/// bundled catalog.
+fn load_skill_declared_config(
+    skills_dir: &std::path::Path,
+    skill_name: &str,
+) -> Option<std::collections::HashMap<String, openfang_skills::config_injection::SkillConfigVar>> {
+    // 1. User-installed skill: skills_dir/<name>/skill.toml, falling back to
+    //    SKILL.md frontmatter if no TOML has been generated yet.
+    let skill_dir = skills_dir.join(skill_name);
+    if skill_dir.is_dir() {
+        let toml_path = skill_dir.join("skill.toml");
+        if toml_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&toml_path) {
+                if let Ok(manifest) = toml::from_str::<openfang_skills::SkillManifest>(&text) {
+                    if manifest.skill.name == skill_name {
+                        return Some(manifest.config);
+                    }
+                }
+            }
+        }
+        let skillmd_path = skill_dir.join("SKILL.md");
+        if skillmd_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&skillmd_path) {
+                if let Ok(converted) =
+                    openfang_skills::openclaw_compat::convert_skillmd_str(skill_name, &text)
+                {
+                    return Some(converted.config_vars);
+                }
+            }
+        }
+    }
+
+    // 2. Bundled skill: look up by name in the compile-time catalog.
+    for (bundled_name, content) in openfang_skills::bundled::bundled_skills() {
+        if bundled_name == skill_name {
+            if let Ok(converted) =
+                openfang_skills::openclaw_compat::convert_skillmd_str(bundled_name, content)
+            {
+                return Some(converted.config_vars);
+            }
+        }
+    }
+
+    None
+}
+
+/// Build the per-skill config state for the GET endpoint.
+///
+/// Returns `None` if the skill is not installed. Resolved values are
+/// redacted when the variable name looks secret (see
+/// [`openfang_skills::config_injection::is_secret_name`]).
+fn build_skill_config_snapshot(
+    state: &Arc<AppState>,
+    skill_name: &str,
+) -> Option<serde_json::Value> {
+    use openfang_skills::config_injection::is_secret_name;
+
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = load_skill_declared_config(&skills_dir, skill_name)?;
+
+    // Snapshot the currently active user config (override map takes priority
+    // over the boot-time `self.config.skills`, matching what `reload_skills`
+    // will actually use).
+    let user_cfg: std::collections::HashMap<String, String> = {
+        let override_guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let source: &std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+            override_guard
+                .as_ref()
+                .unwrap_or(&state.kernel.config.skills);
+        source.get(skill_name).cloned().unwrap_or_default()
+    };
+
+    let mut declared_json = serde_json::Map::new();
+    let mut resolved_json = serde_json::Map::new();
+
+    for (name, var) in declared.iter() {
+        declared_json.insert(
+            name.clone(),
+            serde_json::json!({
+                "description": var.description,
+                "env": var.env,
+                "default": var.default,
+                "required": var.required,
+            }),
+        );
+
+        let is_secret = is_secret_name(name);
+        let (value_opt, source) = if let Some(v) = user_cfg.get(name) {
+            (Some(v.clone()), "user")
+        } else if let Some(env_name) = var.env.as_ref() {
+            match std::env::var(env_name) {
+                Ok(v) if !v.is_empty() => (Some(v), "env"),
+                _ => {
+                    if let Some(d) = var.default.as_ref() {
+                        (Some(d.clone()), "default")
+                    } else {
+                        (None, "unresolved")
+                    }
+                }
+            }
+        } else if let Some(d) = var.default.as_ref() {
+            (Some(d.clone()), "default")
+        } else {
+            (None, "unresolved")
+        };
+
+        // Redact secrets for the wire response.
+        let shown_value: serde_json::Value = match value_opt {
+            Some(v) if is_secret => {
+                let prefix: String = v.chars().take(4).collect();
+                if prefix.is_empty() {
+                    serde_json::Value::String("***redacted***".to_string())
+                } else {
+                    serde_json::Value::String(format!("{prefix}***redacted***"))
+                }
+            }
+            Some(v) => serde_json::Value::String(v),
+            None => serde_json::Value::Null,
+        };
+
+        resolved_json.insert(
+            name.clone(),
+            serde_json::json!({
+                "value": shown_value,
+                "source": source,
+                "is_secret": is_secret,
+            }),
+        );
+    }
+
+    Some(serde_json::json!({
+        "skill": skill_name,
+        "declared": serde_json::Value::Object(declared_json),
+        "resolved": serde_json::Value::Object(resolved_json),
+    }))
+}
+
+/// GET /api/skills/{id}/config — Return declared + resolved per-skill config.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "skill": "github-helper",
+///   "declared": {
+///     "github_token": { "description": "...", "env": "GH_TOKEN", "default": null, "required": true }
+///   },
+///   "resolved": {
+///     "github_token": { "value": "ghp_***redacted***", "source": "user", "is_secret": true }
+///   }
+/// }
+/// ```
+///
+/// Secret-looking values (`*_token`, `*_key`, `*_secret`, `password`) are
+/// always redacted in the `value` field. The `source` field names the layer
+/// that won: `"user"`, `"env"`, `"default"`, or `"unresolved"`.
+pub async fn get_skill_config(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+) -> impl IntoResponse {
+    match build_skill_config_snapshot(&state, &skill_name) {
+        Some(snapshot) => (StatusCode::OK, Json(snapshot)),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+        ),
+    }
+}
+
+/// Request body for `PUT /api/skills/{id}/config`.
+#[derive(Debug, serde::Deserialize)]
+pub struct SkillConfigPutRequest {
+    /// New per-variable values. Keys must match declared variable names.
+    pub values: std::collections::HashMap<String, String>,
+}
+
+/// PUT /api/skills/{id}/config — Write user overrides for a skill's config.
+///
+/// The body is `{"values": {"<var_name>": "<value>"}}`. Only declared
+/// variables are accepted; unknown keys return 400. After the config.toml is
+/// atomically rewritten, the kernel's skill registry is reloaded so the
+/// change takes effect immediately.
+pub async fn put_skill_config(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+    Json(body): Json<SkillConfigPutRequest>,
+) -> impl IntoResponse {
+    // Refuse to operate on unknown skill (matching GET behavior). We read
+    // the declared config directly instead of going through the registry so
+    // a skill with required-but-unresolved vars is still editable.
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = match load_skill_declared_config(&skills_dir, &skill_name) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+    };
+
+    // Reject unknown keys.
+    for k in body.values.keys() {
+        if !declared.contains_key(k) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Variable '{k}' is not declared by skill '{skill_name}'")
+                })),
+            );
+        }
+    }
+
+    // Build the final in-memory skill-configs map: start from the current
+    // override (or boot-time config), replace the skill's section with the
+    // incoming values.
+    let mut all_configs: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = {
+        let guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+    all_configs.insert(skill_name.clone(), body.values.clone());
+
+    // Persist atomically to config.toml.
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_skill_config(&config_path, &skill_name, &body.values) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to persist skill config: {e}")
+            })),
+        );
+    }
+
+    // Reload so agents see the new config on their next prompt build.
+    state.kernel.reload_skills_with_configs(all_configs);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "saved",
+            "skill": skill_name,
+            "reloaded": true,
+        })),
+    )
+}
+
+/// DELETE /api/skills/{id}/config/{var_name} — Remove a single user override.
+///
+/// After removal, the variable falls back to env or default on the next
+/// prompt build. If removing the override would leave a `required` variable
+/// with no resolvable value, the request fails with 409 Conflict so the
+/// caller is never tricked into a broken state.
+pub async fn delete_skill_config_var(
+    State(state): State<Arc<AppState>>,
+    Path((skill_name, var_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = match load_skill_declared_config(&skills_dir, &skill_name) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+    };
+
+    let var_def = match declared.get(&var_name) {
+        Some(v) => v.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Variable '{var_name}' is not declared by skill '{skill_name}'")
+                })),
+            );
+        }
+    };
+
+    // If the var is required, make sure env or default still resolves;
+    // otherwise we would leave the skill unable to register after reload.
+    if var_def.required {
+        let env_resolves = var_def
+            .env
+            .as_ref()
+            .and_then(|e| std::env::var(e).ok())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let default_resolves = var_def
+            .default
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !env_resolves && !default_resolves {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Cannot remove override: '{var_name}' is required and has no env/default fallback"
+                    )
+                })),
+            );
+        }
+    }
+
+    let mut all_configs: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = {
+        let guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+    if let Some(skill_map) = all_configs.get_mut(&skill_name) {
+        skill_map.remove(&var_name);
+        if skill_map.is_empty() {
+            all_configs.remove(&skill_name);
+        }
+    }
+
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = remove_skill_config_var(&config_path, &skill_name, &var_name) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to update config.toml: {e}")
+            })),
+        );
+    }
+
+    state.kernel.reload_skills_with_configs(all_configs);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "removed",
+            "skill": skill_name,
+            "var": var_name,
+            "reloaded": true,
+        })),
+    )
+}
+
+/// Atomically upsert `[skills.<skill_name>]` in config.toml.
+///
+/// Writes to `<path>.tmp` then renames — so a crash during the write never
+/// leaves a half-truncated config on disk. Existing root-level fields are
+/// preserved; only the named skill's section is replaced.
+fn upsert_skill_config(
+    config_path: &std::path::Path,
+    skill_name: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("skills") {
+        root.insert(
+            "skills".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let skills_table = root
+        .get_mut("skills")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("skills is not a table")?;
+
+    let mut skill_section = toml::map::Map::new();
+    for (k, v) in values {
+        skill_section.insert(k.clone(), toml::Value::String(v.clone()));
+    }
+    skills_table.insert(skill_name.to_string(), toml::Value::Table(skill_section));
+
+    atomic_write_toml(config_path, &doc)?;
+    Ok(())
+}
+
+/// Atomically remove a single variable from `[skills.<skill_name>]`.
+///
+/// If the skill table becomes empty the table itself is removed so we don't
+/// leave empty sections lying around.
+fn remove_skill_config_var(
+    config_path: &std::path::Path,
+    skill_name: &str,
+    var_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut doc: toml::Value = toml::from_str(&content)?;
+
+    let root = match doc.as_table_mut() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let mut remove_skill = false;
+    if let Some(skills_table) = root.get_mut("skills").and_then(|v| v.as_table_mut()) {
+        if let Some(skill_section) = skills_table
+            .get_mut(skill_name)
+            .and_then(|v| v.as_table_mut())
+        {
+            skill_section.remove(var_name);
+            if skill_section.is_empty() {
+                remove_skill = true;
+            }
+        }
+        if remove_skill {
+            skills_table.remove(skill_name);
+        }
+    }
+
+    atomic_write_toml(config_path, &doc)?;
+    Ok(())
+}
+
+/// Write a TOML value to disk atomically via a sibling temp file + rename.
+///
+/// On Windows, `rename` is atomic on the same volume when the destination
+/// does not exist; if it does we fall back to the non-atomic write path and
+/// still cover the "crash mid-write truncates config.toml" class of bug.
+fn atomic_write_toml(
+    config_path: &std::path::Path,
+    doc: &toml::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let rendered = toml::to_string_pretty(doc)?;
+    let tmp_path = match config_path.file_name() {
+        Some(name) => {
+            let mut tmp_name = std::ffi::OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(".tmp");
+            config_path.with_file_name(tmp_name)
+        }
+        None => config_path.with_extension("tmp"),
+    };
+    std::fs::write(&tmp_path, rendered)?;
+    match std::fs::rename(&tmp_path, config_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Fallback: direct write, then best-effort cleanup of temp.
+            let rendered = toml::to_string_pretty(doc)?;
+            std::fs::write(config_path, rendered)?;
+            let _ = std::fs::remove_file(&tmp_path);
+            Ok(())
+        }
+    }
 }
 
 // ── Helper functions for secrets.env management ────────────────────────
@@ -8518,40 +9320,70 @@ pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl Int
 // ---------------------------------------------------------------------------
 // Scheduled Jobs (cron) endpoints
 // ---------------------------------------------------------------------------
+//
+// Historical note: an earlier implementation of `/api/schedules*` wrote to a
+// shared-memory key (`__openfang_schedules`) that no executor ever read — so
+// scheduled jobs registered via this API never actually fired (#1069). These
+// routes now delegate to the kernel's real cron scheduler, which already
+// backs `/api/cron/jobs*`. The request/response shape has been preserved as
+// close as possible to the legacy route for dashboard compatibility.
 
-/// The well-known shared-memory agent ID used for cross-agent KV storage.
-/// Must match the value in `openfang-kernel/src/kernel.rs::shared_memory_agent_id()`.
-fn schedule_shared_agent_id() -> AgentId {
-    AgentId(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ]))
+/// Convert an internal `CronJob` into the legacy `/api/schedules` response
+/// shape so existing dashboard code keeps working.
+fn cron_job_to_schedule_view(
+    kernel: &OpenFangKernel,
+    job: &openfang_types::scheduler::CronJob,
+) -> serde_json::Value {
+    use openfang_types::scheduler::{CronAction, CronSchedule};
+
+    let cron = match &job.schedule {
+        CronSchedule::Cron { expr, .. } => expr.clone(),
+        CronSchedule::Every { every_secs } => format!("every {every_secs}s"),
+        CronSchedule::At { at } => at.to_rfc3339(),
+    };
+    let message = match &job.action {
+        CronAction::AgentTurn { message, .. } => message.clone(),
+        CronAction::SystemEvent { text } => text.clone(),
+        CronAction::WorkflowRun { workflow_id, .. } => format!("workflow:{workflow_id}"),
+    };
+    let meta = kernel.cron_scheduler.get_meta(job.id);
+    let last_status = meta.as_ref().and_then(|m| m.last_status.clone());
+    // Serialize delivery_targets so dashboard chips/editor round-trip cleanly.
+    let delivery_targets = serde_json::to_value(&job.delivery_targets)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+
+    serde_json::json!({
+        "id": job.id.to_string(),
+        "name": job.name,
+        "cron": cron,
+        "agent_id": job.agent_id.to_string(),
+        "message": message,
+        "enabled": job.enabled,
+        "created_at": job.created_at.to_rfc3339(),
+        "last_run": job.last_run.map(|t| t.to_rfc3339()),
+        "next_run": job.next_run.map(|t| t.to_rfc3339()),
+        "last_status": last_status,
+        "delivery_targets": delivery_targets,
+    })
 }
 
-const SCHEDULES_KEY: &str = "__openfang_schedules";
-
-/// GET /api/schedules — List all cron-based scheduled jobs.
+/// GET /api/schedules — List all scheduled jobs from the cron scheduler.
 pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agent_id = schedule_shared_agent_id();
-    match state.kernel.memory.structured_get(agent_id, SCHEDULES_KEY) {
-        Ok(Some(serde_json::Value::Array(arr))) => {
-            let total = arr.len();
-            Json(serde_json::json!({"schedules": arr, "total": total}))
-        }
-        Ok(_) => Json(serde_json::json!({"schedules": [], "total": 0})),
-        Err(e) => {
-            tracing::warn!("Failed to load schedules: {e}");
-            Json(serde_json::json!({"schedules": [], "total": 0, "error": format!("{e}")}))
-        }
-    }
+    let jobs = state.kernel.cron_scheduler.list_all_jobs();
+    let total = jobs.len();
+    let schedules: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| cron_job_to_schedule_view(&state.kernel, j))
+        .collect();
+    Json(serde_json::json!({"schedules": schedules, "total": total}))
 }
 
-/// POST /api/schedules — Create a new cron-based scheduled job.
+/// POST /api/schedules — Create a new scheduled job in the cron scheduler.
 pub async fn create_schedule(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let name = match req["name"].as_str() {
+    let name_raw = match req["name"].as_str() {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => {
             return (
@@ -8571,7 +9403,6 @@ pub async fn create_schedule(
         }
     };
 
-    // Validate cron expression: must be 5 space-separated fields
     let cron_parts: Vec<&str> = cron.split_whitespace().collect();
     if cron_parts.len() != 5 {
         return (
@@ -8589,166 +9420,261 @@ pub async fn create_schedule(
             Json(serde_json::json!({"error": "Missing required field: agent_id"})),
         );
     }
-    // Validate agent exists (UUID or name lookup)
-    let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-        state.kernel.registry.get(aid).is_some()
+    let target_agent = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+        if state.kernel.registry.get(aid).is_some() {
+            Some(aid)
+        } else {
+            None
+        }
     } else {
         state
             .kernel
             .registry
             .list()
-            .iter()
-            .any(|a| a.name == agent_id_str)
+            .into_iter()
+            .find(|a| a.name == agent_id_str)
+            .map(|a| a.id)
     };
-    if !agent_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
-        );
-    }
+    let target_agent = match target_agent {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
+            );
+        }
+    };
+
     let message = req["message"].as_str().unwrap_or("").to_string();
     let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let job_message = if message.is_empty() {
+        format!("[Scheduled task '{name_raw}']")
+    } else {
+        message.clone()
+    };
 
-    let schedule_id = uuid::Uuid::new_v4().to_string();
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "name": name,
-        "cron": cron,
-        "agent_id": agent_id_str,
-        "message": message,
-        "enabled": enabled,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "last_run": null,
-        "run_count": 0,
-    });
-
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    schedules.push(entry.clone());
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        tracing::warn!("Failed to save schedule: {e}");
+    // Accept multi-destination delivery targets. Validate each entry matches
+    // the `CronDeliveryTarget` shape up front so we return a 400 rather than
+    // silently dropping targets or failing later in the kernel.
+    let delivery_targets_raw = req
+        .get("delivery_targets")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !delivery_targets_raw.is_null() && !delivery_targets_raw.is_array() {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save schedule: {e}")})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "delivery_targets must be an array"
+            })),
         );
     }
+    if let Some(arr) = delivery_targets_raw.as_array() {
+        for (idx, t) in arr.iter().enumerate() {
+            if let Err(e) =
+                serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("delivery_targets[{idx}] invalid: {e}")
+                    })),
+                );
+            }
+        }
+    }
 
-    (StatusCode::CREATED, Json(entry))
+    let mut job_json = serde_json::json!({
+        "name": sanitize_schedule_job_name(&name_raw),
+        "schedule": { "kind": "cron", "expr": cron, "tz": null },
+        "action": {
+            "kind": "agent_turn",
+            "message": job_message,
+            "model_override": null,
+            "timeout_secs": null,
+        },
+        "delivery": { "kind": "none" },
+        "one_shot": false,
+    });
+    if let Some(arr) = delivery_targets_raw.as_array() {
+        job_json["delivery_targets"] = serde_json::Value::Array(arr.clone());
+    }
+
+    match state
+        .kernel
+        .cron_create(&target_agent.to_string(), job_json)
+        .await
+    {
+        Ok(resp) => {
+            let job_id = serde_json::from_str::<serde_json::Value>(&resp)
+                .ok()
+                .and_then(|v| v["job_id"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if !enabled {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+                    let _ = state.kernel.cron_scheduler.set_enabled(cj_id, false);
+                    let _ = state.kernel.cron_scheduler.persist();
+                }
+            }
+            // Build response in the legacy shape.
+            let body = if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                let cj_id = openfang_types::scheduler::CronJobId(uuid);
+                match state.kernel.cron_scheduler.get_job(cj_id) {
+                    Some(job) => cron_job_to_schedule_view(&state.kernel, &job),
+                    None => serde_json::json!({
+                        "id": job_id,
+                        "name": name_raw,
+                        "cron": cron,
+                        "agent_id": target_agent.to_string(),
+                        "message": message,
+                        "enabled": enabled,
+                    }),
+                }
+            } else {
+                serde_json::json!({
+                    "id": job_id,
+                    "name": name_raw,
+                    "cron": cron,
+                    "agent_id": target_agent.to_string(),
+                    "message": message,
+                    "enabled": enabled,
+                })
+            };
+            (StatusCode::CREATED, Json(body))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Failed to create schedule: {e}")})),
+        ),
+    }
 }
 
-/// PUT /api/schedules/:id — Update a scheduled job (toggle enabled, edit fields).
+/// PUT /api/schedules/:id — Update a scheduled job.
+///
+/// Supports toggling `enabled`. Other fields are not mutable without a
+/// delete+recreate (the underlying cron scheduler does not expose in-place
+/// edits); those are accepted but ignored with a note in the response.
 pub async fn update_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let mut found = false;
-    for s in schedules.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            found = true;
-            if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-                s["enabled"] = serde_json::Value::Bool(enabled);
-            }
-            if let Some(name) = req.get("name").and_then(|v| v.as_str()) {
-                s["name"] = serde_json::Value::String(name.to_string());
-            }
-            if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
-                let cron_parts: Vec<&str> = cron.split_whitespace().collect();
-                if cron_parts.len() != 5 {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "Invalid cron expression"})),
-                    );
-                }
-                s["cron"] = serde_json::Value::String(cron.to_string());
-            }
-            if let Some(agent_id) = req.get("agent_id").and_then(|v| v.as_str()) {
-                s["agent_id"] = serde_json::Value::String(agent_id.to_string());
-            }
-            if let Some(message) = req.get("message").and_then(|v| v.as_str()) {
-                s["message"] = serde_json::Value::String(message.to_string());
-            }
-            break;
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
         }
-    }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
 
-    if !found {
+    if state.kernel.cron_scheduler.get_job(cj_id).is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Schedule not found"})),
         );
     }
 
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update schedule: {e}")})),
-        );
+    let mut note: Option<&'static str> = None;
+    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
+        if let Err(e) = state.kernel.cron_scheduler.set_enabled(cj_id, enabled) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+        let _ = state.kernel.cron_scheduler.persist();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "updated", "schedule_id": id})),
-    )
+    // Apply a full replacement of delivery_targets when supplied. Validation
+    // is done up front via serde so a bad entry produces a 400 rather than
+    // silently replacing the list with the valid subset.
+    if let Some(raw_targets) = req.get("delivery_targets") {
+        if !raw_targets.is_array() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "delivery_targets must be an array"})),
+            );
+        }
+        let arr = raw_targets.as_array().unwrap();
+        let mut parsed: Vec<openfang_types::scheduler::CronDeliveryTarget> =
+            Vec::with_capacity(arr.len());
+        for (idx, t) in arr.iter().enumerate() {
+            match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
+            {
+                Ok(dt) => parsed.push(dt),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("delivery_targets[{idx}] invalid: {e}")
+                        })),
+                    );
+                }
+            }
+        }
+        if let Err(e) = state
+            .kernel
+            .cron_scheduler
+            .set_delivery_targets(cj_id, parsed)
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+        let _ = state.kernel.cron_scheduler.persist();
+    }
+
+    if req.get("name").is_some()
+        || req.get("cron").is_some()
+        || req.get("agent_id").is_some()
+        || req.get("message").is_some()
+    {
+        note = Some("Only 'enabled' and 'delivery_targets' are mutable; delete and recreate to change other fields.");
+    }
+
+    let mut body = serde_json::json!({"status": "updated", "schedule_id": id});
+    if let Some(n) = note {
+        body["note"] = serde_json::Value::String(n.to_string());
+    }
+    // Echo the new view so callers can confirm without a second GET.
+    if let Some(job) = state.kernel.cron_scheduler.get_job(cj_id) {
+        body["schedule"] = cron_job_to_schedule_view(&state.kernel, &job);
+    }
+    (StatusCode::OK, Json(body))
 }
 
-/// DELETE /api/schedules/:id — Remove a scheduled job.
+/// DELETE /api/schedules/:id — Remove a scheduled job from the cron scheduler.
 pub async fn delete_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(&id));
-
-    if schedules.len() == before {
-        return (
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    match state.kernel.cron_scheduler.remove_job(cj_id) {
+        Ok(_) => {
+            let _ = state.kernel.cron_scheduler.persist();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "removed", "schedule_id": id})),
+            )
+        }
+        Err(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Schedule not found"})),
-        );
+        ),
     }
-
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete schedule: {e}")})),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "schedule_id": id})),
-    )
 }
 
 /// POST /api/schedules/:id/run — Manually run a scheduled job now.
@@ -8756,101 +9682,41 @@ pub async fn run_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let schedule = match schedules.iter().find(|s| s["id"].as_str() == Some(&id)) {
-        Some(s) => s.clone(),
-        None => {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    let job = match state.kernel.cron_scheduler.try_claim_for_run(cj_id) {
+        Ok(j) => j,
+        Err(openfang_kernel::cron::ClaimError::NotFound) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Schedule not found"})),
             );
         }
-    };
-
-    let agent_id_str = schedule["agent_id"].as_str().unwrap_or("");
-    let message = schedule["message"]
-        .as_str()
-        .unwrap_or("Scheduled task triggered manually.");
-    let name = schedule["name"].as_str().unwrap_or("(unnamed)");
-
-    // Find the target agent — require explicit agent_id, no silent fallback
-    let target_agent = if !agent_id_str.is_empty() {
-        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            if state.kernel.registry.get(aid).is_some() {
-                Some(aid)
-            } else {
-                None
-            }
-        } else {
-            state
-                .kernel
-                .registry
-                .list()
-                .iter()
-                .find(|a| a.name == agent_id_str)
-                .map(|a| a.id)
-        }
-    } else {
-        None
-    };
-
-    let target_agent = match target_agent {
-        Some(a) => a,
-        None => {
+        Err(openfang_kernel::cron::ClaimError::Disabled) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::json!({"error": "No target agent found. Specify an agent_id or start an agent first."}),
-                ),
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Schedule is disabled"})),
             );
         }
     };
 
-    let run_message = if message.is_empty() {
-        format!("[Scheduled task '{}' triggered manually]", name)
-    } else {
-        message.to_string()
-    };
-
-    // Update last_run and run_count
-    let mut schedules_updated: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-    for s in schedules_updated.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            s["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            let count = s["run_count"].as_u64().unwrap_or(0);
-            s["run_count"] = serde_json::json!(count + 1);
-            break;
-        }
-    }
-    let _ = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules_updated),
-    );
-
-    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
-        .kernel
-        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle), None, None)
-        .await
-    {
-        Ok(result) => (
+    let agent_id_str = job.agent_id.to_string();
+    match state.kernel.cron_run_job(&job).await {
+        Ok(response) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "completed",
                 "schedule_id": id,
-                "agent_id": target_agent.to_string(),
-                "response": result.response,
+                "agent_id": agent_id_str,
+                "response": response,
             })),
         ),
         Err(e) => (
@@ -8862,6 +9728,73 @@ pub async fn run_schedule(
             })),
         ),
     }
+}
+
+/// GET /api/schedules/{id}/delivery-log — Return the last N per-target
+/// delivery results for a schedule.
+///
+/// Delivery results are not yet persisted across runs, so this endpoint
+/// returns an empty list for jobs that exist. A future change can back this
+/// with a ring buffer populated by `cron_fan_out_targets`. The endpoint is
+/// wired up now so the dashboard can call it without a placeholder.
+pub async fn schedule_delivery_log(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    let job = match state.kernel.cron_scheduler.get_job(cj_id) {
+        Some(j) => j,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Schedule not found"})),
+            );
+        }
+    };
+    // Delivery history is not yet persisted; surface the target list with
+    // empty result arrays so the UI has stable shape to render.
+    let targets: Vec<serde_json::Value> = job
+        .delivery_targets
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schedule_id": id,
+            "targets": targets,
+            "entries": [],
+        })),
+    )
+}
+
+/// Sanitize a user-supplied schedule name into a valid `CronJob.name`.
+/// Matches the kernel's own sanitizer used by the migration path.
+fn sanitize_schedule_job_name(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return "schedule".to_string();
+    }
+    trimmed.chars().take(128).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -9209,12 +10142,49 @@ pub async fn patch_agent_config(
 // ---------------------------------------------------------------------------
 
 /// Request body for cloning an agent.
+///
+/// `overrides` is a free-form JSON object that is deep-merged onto the cloned
+/// manifest before spawning. This lets callers tweak fields like `description`,
+/// `tags`, `model`, etc. without re-stating the entire manifest. The `name`
+/// field on `overrides` is ignored — `new_name` always wins.
 #[derive(serde::Deserialize)]
 pub struct CloneAgentRequest {
     pub new_name: String,
+    #[serde(default)]
+    pub overrides: Option<serde_json::Value>,
 }
 
-/// POST /api/agents/{id}/clone — Clone an agent with its workspace files.
+/// Workspace files that contain accumulated memory or per-session state and
+/// MUST NOT be copied when cloning an agent. The cloned agent starts with
+/// independent memory by design (see issue #868).
+const MEMORY_FILES: &[&str] = &["MEMORY.md", "HEARTBEAT.md"];
+
+/// Deep-merge `overrides` onto `base` JSON. Object fields are recursively
+/// merged; arrays and scalars are replaced.
+fn deep_merge_json(base: &mut serde_json::Value, overrides: serde_json::Value) {
+    match (base, overrides) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+            for (k, v) in over_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => deep_merge_json(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, value) => {
+            *slot = value;
+        }
+    }
+}
+
+/// POST /api/agents/{template_id}/clone — Clone a template agent into a new
+/// independent agent with its own workspace and memory.
+///
+/// Body: `{ "new_name": "user-42", "overrides": { ... } }`
+///
+/// Returns: `{ "agent_id": "...", "name": "...", "manifest": { ... } }`
 pub async fn clone_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -9225,7 +10195,7 @@ pub async fn clone_agent(
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
+                Json(serde_json::json!({"error": "Invalid template agent ID"})),
             );
         }
     };
@@ -9237,29 +10207,90 @@ pub async fn clone_agent(
         );
     }
 
-    if req.new_name.trim().is_empty() {
+    let new_name = req.new_name.trim().to_string();
+    if new_name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "new_name cannot be empty"})),
         );
     }
 
+    // Reject names with path separators / control chars to keep workspace dir naming safe.
+    if new_name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0' || c.is_control())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "new_name contains invalid characters"})),
+        );
+    }
+
+    // Reject if template doesn't exist.
     let source = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Agent not found"})),
+                Json(serde_json::json!({"error": "Template agent not found"})),
             );
         }
     };
 
-    // Deep-clone manifest with new name
-    let mut cloned_manifest = source.manifest.clone();
-    cloned_manifest.name = req.new_name.clone();
-    cloned_manifest.workspace = None; // Let kernel assign a new workspace
+    // Reject if new_name collides with an existing agent.
+    if state.kernel.registry.find_by_name(&new_name).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("An agent named '{}' already exists", new_name)
+            })),
+        );
+    }
 
-    // Spawn the cloned agent
+    // Deep-clone manifest and apply overrides.
+    let mut cloned_manifest = source.manifest.clone();
+    if let Some(overrides) = req.overrides.clone() {
+        if !overrides.is_object() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "overrides must be a JSON object"})),
+            );
+        }
+        // Serialize manifest to JSON, merge overrides, deserialize back.
+        // This lets callers patch arbitrary nested fields without exhaustive enumeration.
+        let mut manifest_json = match serde_json::to_value(&cloned_manifest) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": format!("Failed to serialize manifest: {e}")}),
+                    ),
+                );
+            }
+        };
+        deep_merge_json(&mut manifest_json, overrides);
+        cloned_manifest = match serde_json::from_value(manifest_json) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({"error": format!("Invalid overrides — manifest no longer valid: {e}")}),
+                    ),
+                );
+            }
+        };
+    }
+
+    // new_name always wins over any name field in overrides.
+    cloned_manifest.name = new_name.clone();
+    // Let the kernel assign fresh workspace and state directory paths.
+    // Never share private state with the template (see issue #868, #1097).
+    cloned_manifest.workspace = None;
+    cloned_manifest.state_dir = None;
+
+    // Spawn the cloned agent.
     let new_id = match state.kernel.spawn_agent(cloned_manifest) {
         Ok(id) => id,
         Err(e) => {
@@ -9270,41 +10301,101 @@ pub async fn clone_agent(
         }
     };
 
-    // Copy workspace files from source to destination
+    // Copy non-memory identity files from source state_dir to destination
+    // state_dir. MEMORY.md and HEARTBEAT.md are intentionally skipped — the
+    // cloned agent must start with independent memory (issue #868). Identity
+    // files live in state_dir per #1097; fall back to legacy workspace for
+    // older agents.
     let new_entry = state.kernel.registry.get(new_id);
-    if let (Some(ref src_ws), Some(ref new_entry)) = (source.manifest.workspace, new_entry) {
+    let src_state = source
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(source.manifest.workspace.as_ref());
+    let dst_state = new_entry.as_ref().and_then(|e| {
+        e.manifest
+            .state_dir
+            .as_ref()
+            .or(e.manifest.workspace.as_ref())
+    });
+    if let (Some(src_ws), Some(dst_ws)) = (src_state, dst_state) {
+        if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
+            for &fname in KNOWN_IDENTITY_FILES {
+                if MEMORY_FILES.contains(&fname) {
+                    continue;
+                }
+                let src_file = src_can.join(fname);
+                let dst_file = dst_can.join(fname);
+                if src_file.exists() {
+                    let _ = std::fs::copy(&src_file, &dst_file);
+                }
+            }
+        }
+    }
+    // Copy the user-facing `skills/` subdirectory so curated skills travel
+    // with the template. These live in the workspace, not the state dir.
+    if let (Some(ref src_ws), Some(ref new_entry)) = (&source.manifest.workspace, &new_entry) {
         if let Some(ref dst_ws) = new_entry.manifest.workspace {
-            // Security: canonicalize both paths
             if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
-                for &fname in KNOWN_IDENTITY_FILES {
-                    let src_file = src_can.join(fname);
-                    let dst_file = dst_can.join(fname);
-                    if src_file.exists() {
-                        let _ = std::fs::copy(&src_file, &dst_file);
-                    }
+                let src_skills = src_can.join("skills");
+                let dst_skills = dst_can.join("skills");
+                if src_skills.is_dir() {
+                    let _ = copy_dir_recursive(&src_skills, &dst_skills);
                 }
             }
         }
     }
 
-    // Copy identity from source
+    // Copy visual identity from source so the clone looks like the template.
     let _ = state
         .kernel
         .registry
         .update_identity(new_id, source.identity.clone());
 
-    // Register in channel router so binding resolution finds the cloned agent
+    // Register in channel router so binding resolution finds the cloned agent.
     if let Some(ref mgr) = *state.bridge_manager.lock().await {
-        mgr.router().register_agent(req.new_name.clone(), new_id);
+        mgr.router().register_agent(new_name.clone(), new_id);
     }
+
+    // Return the freshly-spawned manifest (after kernel assigned workspace etc).
+    let manifest_value = new_entry
+        .as_ref()
+        .and_then(|e| serde_json::to_value(&e.manifest).ok())
+        .unwrap_or(serde_json::Value::Null);
 
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "agent_id": new_id.to_string(),
-            "name": req.new_name,
+            "name": new_name,
+            "manifest": manifest_value,
         })),
     )
+}
+
+/// Recursively copy a directory tree. Skips any file whose name appears in
+/// `MEMORY_FILES`. Best-effort: errors on individual entries are swallowed so
+/// a clone can still partially succeed (the caller will see the new agent ID).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        if let Some(name_str) = name.to_str() {
+            if MEMORY_FILES.contains(&name_str) {
+                continue;
+            }
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        if file_type.is_dir() {
+            let _ = copy_dir_recursive(&src_path, &dst_path);
+        } else if file_type.is_file() {
+            let _ = std::fs::copy(&src_path, &dst_path);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -9348,8 +10439,16 @@ pub async fn list_agent_files(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to the legacy workspace location for agents created before the
+    // split so existing on-disk files remain reachable.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -9410,8 +10509,15 @@ pub async fn get_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to legacy workspace for agents created before the split.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -9517,8 +10623,15 @@ pub async fn set_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to legacy workspace for agents created before the split.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -10941,40 +12054,82 @@ pub async fn pairing_notify(
         .into_response()
 }
 
-/// GET /api/commands — List available chat commands (for dynamic slash menu).
-pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut commands: Vec<serde_json::Value> = channel_command_specs()
-        .iter()
-        .map(|spec| {
+/// GET /api/commands?surface=web|cli|channel|all — List slash commands from the
+/// unified command registry, filtered by surface.
+///
+/// Query params:
+///   - `surface`: one of `web` (default), `cli`, `channel`, `all`.
+///
+/// Returns:
+/// ```json
+/// {
+///   "surface": "web",
+///   "commands": [
+///     {
+///       "name": "new",
+///       "aliases": ["reset"],
+///       "description": "Reset session (clear history)",
+///       "category": "session",
+///       "requires_agent": true
+///     },
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// Unknown surface values return 400.
+pub async fn list_commands(Query(params): Query<CommandsQuery>) -> impl IntoResponse {
+    use openfang_types::commands::{self, CommandCategory, Surfaces};
+
+    let surface_raw = params.surface.as_deref().unwrap_or("web");
+    let surface = match surface_raw.to_ascii_lowercase().as_str() {
+        "web" => Surfaces::WEB,
+        "cli" => Surfaces::CLI,
+        "channel" => Surfaces::CHANNEL,
+        "all" => Surfaces::ALL,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Unknown surface '{other}'. Valid: web, cli, channel, all."
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let category_slug = |c: CommandCategory| -> &'static str {
+        match c {
+            CommandCategory::General => "general",
+            CommandCategory::Session => "session",
+            CommandCategory::Model => "model",
+            CommandCategory::Memory => "memory",
+            CommandCategory::Control => "control",
+            CommandCategory::Info => "info",
+            CommandCategory::Automation => "automation",
+            CommandCategory::Monitoring => "monitoring",
+        }
+    };
+
+    let commands: Vec<serde_json::Value> = commands::list_for_surface(surface)
+        .map(|def| {
             serde_json::json!({
-                "cmd": format!("/{}", spec.name),
-                "desc": spec.desc,
-                "source": "channel",
+                "name": def.name,
+                "aliases": def.aliases,
+                "description": def.description,
+                "category": category_slug(def.category),
+                "requires_agent": def.requires_agent,
             })
         })
         .collect();
 
-    commands.extend([
-        serde_json::json!({"cmd": "/context", "desc": "Show context window usage & pressure"}),
-        serde_json::json!({"cmd": "/verbose", "desc": "Cycle tool detail level (/verbose [off|on|full])"}),
-        serde_json::json!({"cmd": "/queue", "desc": "Check if agent is processing"}),
-        serde_json::json!({"cmd": "/clear", "desc": "Clear chat display"}),
-        serde_json::json!({"cmd": "/exit", "desc": "Disconnect from agent"}),
-    ]);
-
-    // Add skill-registered tool names as potential commands
-    if let Ok(registry) = state.kernel.skill_registry.read() {
-        for skill in registry.list() {
-            let desc: String = skill.manifest.skill.description.chars().take(80).collect();
-            commands.push(serde_json::json!({
-                "cmd": format!("/{}", skill.manifest.skill.name),
-                "desc": if desc.is_empty() { format!("Skill: {}", skill.manifest.skill.name) } else { desc },
-                "source": "skill",
-            }));
-        }
-    }
-
-    Json(serde_json::json!({"commands": commands}))
+    Json(serde_json::json!({
+        "surface": surface_raw.to_ascii_lowercase(),
+        "commands": commands,
+    }))
+    .into_response()
 }
 
 /// SECURITY: Validate webhook bearer token using constant-time comparison.
@@ -11686,17 +12841,7 @@ pub async fn auth_check(
     };
 
     // Check session cookie
-    let session_user = request
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|c| {
-                c.trim()
-                    .strip_prefix("openfang_session=")
-                    .map(|v| v.to_string())
-            })
-        })
+    let session_user = crate::session_auth::extract_session_cookie(request.headers())
         .and_then(|token| crate::session_auth::verify_session_token(&token, &secret));
 
     if let Some(username) = session_user {
@@ -11787,6 +12932,241 @@ mod channel_config_tests {
                 .find(|f| f.key == "secret_env")
                 .unwrap()
                 .required
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_config_tests {
+    //! Unit tests for the `/api/skills/{id}/config` endpoints.
+    //!
+    //! These exercise the on-disk TOML writer and the in-memory snapshot
+    //! builder directly. Live end-to-end coverage (real HTTP, real kernel)
+    //! lives in `tests/skill_config_api_test.rs`.
+
+    use super::*;
+
+    fn sample_values() -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("github_token".to_string(), "ghp_test1234".to_string());
+        m.insert("default_branch".to_string(), "develop".to_string());
+        m
+    }
+
+    #[test]
+    fn upsert_creates_skills_section_from_blank_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[skills.demo-skill]"), "text was: {text}");
+        assert!(text.contains("github_token = \"ghp_test1234\""));
+        assert!(text.contains("default_branch = \"develop\""));
+    }
+
+    #[test]
+    fn upsert_preserves_other_root_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "log_level = \"debug\"\napi_listen = \"127.0.0.1:4200\"\n",
+        )
+        .unwrap();
+
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("log_level"), "log_level lost: {text}");
+        assert!(text.contains("api_listen"), "api_listen lost: {text}");
+        assert!(text.contains("[skills.demo-skill]"));
+    }
+
+    #[test]
+    fn upsert_replaces_existing_section_wholesale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[skills.demo-skill]\nold_key = \"old_value\"\nshared = \"before\"\n",
+        )
+        .unwrap();
+
+        let mut new_values = std::collections::HashMap::new();
+        new_values.insert("shared".to_string(), "after".to_string());
+        upsert_skill_config(&path, "demo-skill", &new_values).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("old_key"), "old_key not dropped: {text}");
+        assert!(text.contains("shared = \"after\""));
+    }
+
+    #[test]
+    fn remove_drops_single_var_but_keeps_table_when_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        remove_skill_config_var(&path, "demo-skill", "github_token").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("github_token"));
+        assert!(text.contains("default_branch"));
+        assert!(text.contains("[skills.demo-skill]"));
+    }
+
+    #[test]
+    fn remove_last_var_removes_whole_skill_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut single = std::collections::HashMap::new();
+        single.insert("only".to_string(), "x".to_string());
+        upsert_skill_config(&path, "demo-skill", &single).unwrap();
+
+        remove_skill_config_var(&path, "demo-skill", "only").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("demo-skill"),
+            "empty section not cleaned up: {text}"
+        );
+    }
+
+    #[test]
+    fn remove_missing_file_is_silent_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // File does not exist — must not error.
+        remove_skill_config_var(&path, "demo-skill", "github_token").unwrap();
+    }
+
+    #[test]
+    fn atomic_write_produces_valid_toml_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut doc = toml::map::Map::new();
+        let mut skills = toml::map::Map::new();
+        let mut inner = toml::map::Map::new();
+        inner.insert(
+            "github_token".to_string(),
+            toml::Value::String("ghp_xyz".to_string()),
+        );
+        skills.insert("demo".to_string(), toml::Value::Table(inner));
+        doc.insert("skills".to_string(), toml::Value::Table(skills));
+        let doc = toml::Value::Table(doc);
+
+        atomic_write_toml(&path, &doc).unwrap();
+
+        let back: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, doc);
+    }
+}
+
+#[cfg(test)]
+mod uninstall_agent_tests {
+    //! Issue #1163 — directory-removal portion of the uninstall flow.
+    //!
+    //! These tests exercise the same logic the route handler runs after
+    //! `kernel.kill_agent()`: locate `<home>/agents/<name>/`, verify it is
+    //! directly under the agents root, and remove it. Live end-to-end
+    //! coverage (real HTTP + kernel) belongs in `tests/api_integration_test.rs`.
+    use std::path::Path;
+
+    /// Mirror of the dir-removal logic in `uninstall_agent`. Kept in sync
+    /// with the route handler so the rules can be unit-tested without a
+    /// running kernel. Returns whether the directory was removed.
+    fn remove_agent_dir(home_dir: &Path, agent_name: &str) -> bool {
+        let agents_dir = home_dir.join("agents");
+        let agent_dir = agents_dir.join(agent_name);
+        if !agent_dir.is_dir() {
+            return false;
+        }
+        let parent_ok = agent_dir
+            .parent()
+            .map(|p| p == agents_dir.as_path())
+            .unwrap_or(false);
+        if !parent_ok {
+            return false;
+        }
+        std::fs::remove_dir_all(&agent_dir).is_ok()
+    }
+
+    #[test]
+    fn removes_agent_directory_under_agents_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("trash-agent")).unwrap();
+        std::fs::write(
+            agents.join("trash-agent").join("agent.toml"),
+            "name = \"trash-agent\"\n",
+        )
+        .unwrap();
+
+        assert!(agents.join("trash-agent").is_dir());
+        let removed = remove_agent_dir(&home, "trash-agent");
+        assert!(removed, "agent directory must be removed");
+        assert!(!agents.join("trash-agent").exists());
+    }
+
+    #[test]
+    fn returns_false_when_no_directory_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+
+        let removed = remove_agent_dir(&home, "ghost-agent");
+        assert!(!removed, "no dir => false, but uninstall still succeeds");
+    }
+
+    #[test]
+    fn does_not_touch_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("trash-agent")).unwrap();
+        std::fs::create_dir_all(agents.join("keep-me")).unwrap();
+        std::fs::write(
+            agents.join("trash-agent").join("agent.toml"),
+            "name = \"trash-agent\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("keep-me").join("agent.toml"),
+            "name = \"keep-me\"\n",
+        )
+        .unwrap();
+
+        assert!(remove_agent_dir(&home, "trash-agent"));
+        assert!(!agents.join("trash-agent").exists());
+        assert!(
+            agents.join("keep-me").is_dir(),
+            "sibling agent dirs must not be touched by uninstall"
+        );
+    }
+
+    #[test]
+    fn rejects_path_traversal_attempt() {
+        // A name like "../escape" would join to a path whose parent is the
+        // agents root only if the file system resolves it that way — but
+        // `parent()` on a non-canonicalized Path returns the textual parent,
+        // which for `<home>/agents/../escape` is `<home>/agents/..`, not
+        // `<home>/agents`. The check rejects it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        // Create a sibling dir outside agents/ that an attacker might want
+        // to delete.
+        std::fs::create_dir_all(home.join("escape")).unwrap();
+        std::fs::write(home.join("escape").join("secret.toml"), "x = 1\n").unwrap();
+
+        let removed = remove_agent_dir(&home, "../escape");
+        assert!(!removed, "must reject path-traversal names");
+        assert!(
+            home.join("escape").is_dir(),
+            "sibling dir outside agents/ must NOT be deleted"
         );
     }
 }

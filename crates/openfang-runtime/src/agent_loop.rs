@@ -40,21 +40,43 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
-/// Timeout for individual tool executions (seconds).
+/// Default timeout for individual tool executions (seconds).
 /// Raised from 60s to 120s for browser automation and long-running builds.
+/// Overridable via `OPENFANG_TOOL_TIMEOUT_SECS` env var. Set to `0` to disable
+/// the timeout entirely (useful for slow local inference like vLLM on old GPUs).
 const TOOL_TIMEOUT_SECS: u64 = 120;
 
-/// Timeout for inter-agent tool calls (seconds).
+/// Default timeout for inter-agent tool calls (seconds).
 /// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
 /// target, so these need a significantly longer timeout than regular tools.
+/// Overridable via `OPENFANG_AGENT_TOOL_TIMEOUT_SECS` env var. Set to `0` to
+/// disable (issue #1125: slow vLLM rigs running Hands need unbounded waits).
 const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Parse a u64 env var, returning `None` when unset or unparseable so the
+/// caller falls back to the compiled-in default.
+fn env_timeout_secs(var: &str) -> Option<u64> {
+    std::env::var(var).ok().and_then(|s| s.trim().parse().ok())
+}
 
 /// Returns the appropriate timeout duration for a given tool name.
 /// Inter-agent calls get a longer timeout since they may trigger full agent loops.
-fn tool_timeout_for(tool_name: &str) -> Duration {
-    match tool_name {
-        "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
-        _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
+///
+/// Returns `None` when the operator opted out by setting the relevant env var
+/// to `0`. In that case the tool runs with no upper bound, which is what users
+/// on slow local inference (vLLM on old GPUs) want for Hands and inter-agent
+/// delegation (issue #1125).
+fn tool_timeout_for(tool_name: &str) -> Option<Duration> {
+    let secs = match tool_name {
+        "agent_send" | "agent_spawn" => {
+            env_timeout_secs("OPENFANG_AGENT_TOOL_TIMEOUT_SECS").unwrap_or(AGENT_TOOL_TIMEOUT_SECS)
+        }
+        _ => env_timeout_secs("OPENFANG_TOOL_TIMEOUT_SECS").unwrap_or(TOOL_TIMEOUT_SECS),
+    };
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
     }
 }
 
@@ -62,8 +84,10 @@ fn tool_timeout_for(tool_name: &str) -> Duration {
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
 
-/// Maximum message history size before auto-trimming to prevent context overflow.
-const MAX_HISTORY_MESSAGES: usize = 20;
+/// Default maximum message history size before auto-trimming to prevent context overflow.
+/// Per-agent overrides come from `AgentManifest::max_history_messages` (issue #871).
+#[allow(dead_code)]
+const MAX_HISTORY_MESSAGES: usize = openfang_types::agent::DEFAULT_MAX_HISTORY_MESSAGES;
 
 /// Detect when the LLM claims to have performed an action (sent, posted, emailed)
 /// without actually calling any tools. Prevents hallucinated completions.
@@ -107,6 +131,78 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
             provider_metadata: None,
         });
     }
+}
+
+/// Build an assistant message that preserves Thinking blocks alongside the
+/// final visible text.
+///
+/// Issue #1098 — thinking-model state preservation.  When the LLM response
+/// contains `ContentBlock::Thinking` (Anthropic extended thinking with
+/// signatures, Gemini 2.5+ thoughts, OpenAI-compat reasoning_content,
+/// MiniMax/Qwen inline `<think>` blocks), the prior code stored only the
+/// final text via `Message::assistant(text)` — discarding all reasoning
+/// state.  On the next turn the model re-derived its answer from scratch
+/// and quality degraded.
+///
+/// This helper preserves the full block list whenever any Thinking block is
+/// present, otherwise returns the legacy `Message::assistant(text)` form so
+/// downstream consumers (channel formatters, JSONL mirrors, embeddings) keep
+/// working without changes.
+///
+/// Note: we deliberately replace any visible Text blocks in `response_blocks`
+/// with `final_text` so that any post-processing the agent loop applied
+/// (phantom-action recovery, accumulated_text fallback, EmptyResponse guard
+/// stub) is reflected in the persisted message.
+fn build_assistant_message_preserving_thinking(
+    response_blocks: &[ContentBlock],
+    final_text: &str,
+) -> Message {
+    // Key on either Thinking or RedactedThinking — Anthropic/Bedrock both
+    // reject extended-thinking history that drops the redacted variant, so a
+    // turn that contains only RedactedThinking must still be preserved.
+    let has_reasoning = response_blocks.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+        )
+    });
+    if !has_reasoning {
+        return Message::assistant(final_text.to_string());
+    }
+
+    // Preserve order: Thinking / RedactedThinking blocks first (in original
+    // order), then a single Text block carrying `final_text`. Tool blocks
+    // aren't expected here (StopReason::EndTurn path), but copy them through
+    // if present so we don't drop information.
+    let mut blocks: Vec<ContentBlock> = Vec::with_capacity(response_blocks.len() + 1);
+    let mut emitted_text = false;
+    for b in response_blocks {
+        match b {
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                blocks.push(b.clone())
+            }
+            ContentBlock::Text { .. } if !emitted_text => {
+                blocks.push(ContentBlock::Text {
+                    text: final_text.to_string(),
+                    provider_metadata: None,
+                });
+                emitted_text = true;
+            }
+            ContentBlock::Text { .. } => {
+                // Drop additional text blocks — final_text already captures
+                // the canonical visible message.
+            }
+            other => blocks.push(other.clone()),
+        }
+    }
+    if !emitted_text && !final_text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: final_text.to_string(),
+            provider_metadata: None,
+        });
+    }
+
+    Message::assistant_with_blocks(blocks)
 }
 
 /// Strip a provider prefix from a model ID before sending to the API.
@@ -163,6 +259,30 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+}
+
+/// Build the user-turn message, combining text with any image content blocks.
+///
+/// When the turn has both text and image blocks the text is emitted as the
+/// first block followed by the images so the LLM sees the full multimodal
+/// turn. When only one is present the single-mode representation is used.
+fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>) -> Message {
+    match blocks {
+        Some(blocks) if !blocks.is_empty() => {
+            if user_message.trim().is_empty() {
+                Message::user_with_blocks(blocks)
+            } else {
+                let mut combined = Vec::with_capacity(blocks.len() + 1);
+                combined.push(ContentBlock::Text {
+                    text: user_message.to_string(),
+                    provider_metadata: None,
+                });
+                combined.extend(blocks);
+                Message::user_with_blocks(combined)
+            }
+        }
+        _ => Message::user(user_message),
+    }
 }
 
 /// Run the agent execution loop for a single user message.
@@ -278,12 +398,10 @@ pub async fn run_agent_loop(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field.
@@ -340,12 +458,15 @@ pub async fn run_agent_loop(
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
     // the catastrophic case where 200+ messages cause instant context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+    // Per-agent cap: manifest override -> runtime default (issue #871).
+    let max_history = manifest.effective_max_history_messages();
+    if messages.len() > max_history {
+        let trim_count = messages.len() - max_history;
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
+            max_history = max_history,
             "Trimming old messages to prevent context overflow"
         );
         messages.drain(..trim_count);
@@ -583,7 +704,16 @@ pub async fn run_agent_loop(
                 };
 
                 final_response = text.clone();
-                session.messages.push(Message::assistant(text));
+                // Issue #1098: persist Thinking blocks alongside the text so
+                // reasoning models retain state across turns.  When the
+                // response carries any Thinking content (Anthropic extended
+                // thinking, Gemini 2.5 thought signatures, DeepSeek-R1/Qwen3
+                // `reasoning_content`, MiniMax inline `<think>`), save the
+                // full content blocks; otherwise fall back to the legacy
+                // Text shape so existing sessions/snapshots stay readable.
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg);
 
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
@@ -697,10 +827,12 @@ pub async fn run_agent_loop(
                 session.messages.push(Message {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(assistant_blocks.clone()),
+                    ..Default::default()
                 });
                 messages.push(Message {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(assistant_blocks),
+                    ..Default::default()
                 });
 
                 // Build allowed tool names list for capability enforcement
@@ -791,49 +923,51 @@ pub async fn run_agent_loop(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
-                    let timeout = tool_timeout_for(&tool_call.name);
-                    let timeout_secs = timeout.as_secs();
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        tool_runner::execute_tool(
-                            &tool_call.id,
-                            &tool_call.name,
-                            &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, timeout_secs
-                                ),
-                                is_error: true,
+                    // Timeout-wrapped execution. `tool_timeout_for` returns None
+                    // when the operator disabled the timeout (issue #1125).
+                    let timeout_opt = tool_timeout_for(&tool_call.name);
+                    let exec_fut = tool_runner::execute_tool(
+                        &tool_call.id,
+                        &tool_call.name,
+                        &tool_call.input,
+                        kernel.as_ref(),
+                        Some(&allowed_tool_names),
+                        Some(&caller_id_str),
+                        skill_registry,
+                        mcp_connections,
+                        web_ctx,
+                        browser_ctx,
+                        if hand_allowed_env.is_empty() {
+                            None
+                        } else {
+                            Some(&hand_allowed_env)
+                        },
+                        workspace_root,
+                        media_engine,
+                        effective_exec_policy,
+                        tts_engine,
+                        docker_config,
+                        process_manager,
+                    );
+                    let result = match timeout_opt {
+                        Some(timeout) => {
+                            let timeout_secs = timeout.as_secs();
+                            match tokio::time::timeout(timeout, exec_fut).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
+                                    openfang_types::tool::ToolResult {
+                                        tool_use_id: tool_call.id.clone(),
+                                        content: format!(
+                                            "Tool '{}' timed out after {}s.",
+                                            tool_call.name, timeout_secs
+                                        ),
+                                        is_error: true,
+                                    }
+                                }
                             }
                         }
+                        None => exec_fut.await,
                     };
 
                     // Fire AfterToolCall hook
@@ -917,6 +1051,7 @@ pub async fn run_agent_loop(
                 let tool_results_msg = Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_result_blocks.clone()),
+                    ..Default::default()
                 };
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
@@ -936,7 +1071,12 @@ pub async fn run_agent_loop(
                     } else {
                         text
                     };
-                    session.messages.push(Message::assistant(&text));
+                    // Issue #1148: preserve Thinking / RedactedThinking blocks
+                    // present in the response so reasoning state survives
+                    // MaxTokens truncation — same as the EndTurn branch.
+                    let assistant_msg =
+                        build_assistant_message_preserving_thinking(&response.content, &text);
+                    session.messages.push(assistant_msg);
                     if let Err(e) = memory.save_session_async(session).await {
                         warn!("Failed to save session on max continuations: {e}");
                     }
@@ -967,10 +1107,15 @@ pub async fn run_agent_loop(
                         directives: Default::default(),
                     });
                 }
-                // Model hit token limit — add partial response and continue
+                // Model hit token limit — add partial response and continue.
+                // Issue #1148: preserve full response content (Thinking,
+                // RedactedThinking, etc.) so reasoning state is not dropped
+                // when continuing across the token-limit boundary.
                 let text = response.text();
-                session.messages.push(Message::assistant(&text));
-                messages.push(Message::assistant(&text));
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg.clone());
+                messages.push(assistant_msg);
                 session.messages.push(Message::user("Please continue."));
                 messages.push(Message::user("Please continue."));
                 warn!(iteration, "Max tokens hit, continuing");
@@ -1121,6 +1266,7 @@ async fn call_with_retry(
                             api_key,
                             base_url: fb.base_url.clone(),
                             skip_permissions: true,
+                            subprocess_timeout_secs: None,
                         };
                         let fb_driver = match crate::drivers::create_driver(&fb_config) {
                             Ok(d) => d,
@@ -1304,6 +1450,7 @@ async fn stream_with_retry(
                             api_key,
                             base_url: fb.base_url.clone(),
                             skip_permissions: true,
+                            subprocess_timeout_secs: None,
                         };
                         let fb_driver = match crate::drivers::create_driver(&fb_config) {
                             Ok(d) => d,
@@ -1479,12 +1626,10 @@ pub async fn run_agent_loop_streaming(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -1532,12 +1677,15 @@ pub async fn run_agent_loop_streaming(
     let mut accumulated_text = String::new();
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+    // Per-agent cap: manifest override -> runtime default (issue #871).
+    let max_history = manifest.effective_max_history_messages();
+    if messages.len() > max_history {
+        let trim_count = messages.len() - max_history;
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
+            max_history = max_history,
             "Trimming old messages to prevent context overflow (streaming)"
         );
         messages.drain(..trim_count);
@@ -1635,6 +1783,12 @@ pub async fn run_agent_loop_streaming(
             } else {
                 cb(LoopPhase::Thinking);
             }
+        }
+
+        // Stamp last_active before the (potentially long) LLM call so the
+        // heartbeat monitor doesn't flag us as unresponsive mid-iteration.
+        if let Some(k) = &kernel {
+            k.touch_agent(&agent_id_str);
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1770,7 +1924,13 @@ pub async fn run_agent_loop_streaming(
                     text
                 };
                 final_response = text.clone();
-                session.messages.push(Message::assistant(text));
+                // Issue #1098: preserve Thinking blocks (with Anthropic
+                // signatures / Gemini thought signatures / inline-think /
+                // reasoning_content) on the persisted assistant turn.  See
+                // build_assistant_message_preserving_thinking for details.
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg);
 
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
@@ -1878,10 +2038,12 @@ pub async fn run_agent_loop_streaming(
                 session.messages.push(Message {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(assistant_blocks.clone()),
+                    ..Default::default()
                 });
                 messages.push(Message {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(assistant_blocks),
+                    ..Default::default()
                 });
 
                 let allowed_tool_names: Vec<String> =
@@ -1970,49 +2132,51 @@ pub async fn run_agent_loop_streaming(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
-                    let timeout = tool_timeout_for(&tool_call.name);
-                    let timeout_secs = timeout.as_secs();
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        tool_runner::execute_tool(
-                            &tool_call.id,
-                            &tool_call.name,
-                            &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, timeout_secs
-                                ),
-                                is_error: true,
+                    // Timeout-wrapped execution. `tool_timeout_for` returns None
+                    // when the operator disabled the timeout (issue #1125).
+                    let timeout_opt = tool_timeout_for(&tool_call.name);
+                    let exec_fut = tool_runner::execute_tool(
+                        &tool_call.id,
+                        &tool_call.name,
+                        &tool_call.input,
+                        kernel.as_ref(),
+                        Some(&allowed_tool_names),
+                        Some(&caller_id_str),
+                        skill_registry,
+                        mcp_connections,
+                        web_ctx,
+                        browser_ctx,
+                        if hand_allowed_env.is_empty() {
+                            None
+                        } else {
+                            Some(&hand_allowed_env)
+                        },
+                        workspace_root,
+                        media_engine,
+                        effective_exec_policy,
+                        tts_engine,
+                        docker_config,
+                        process_manager,
+                    );
+                    let result = match timeout_opt {
+                        Some(timeout) => {
+                            let timeout_secs = timeout.as_secs();
+                            match tokio::time::timeout(timeout, exec_fut).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
+                                    openfang_types::tool::ToolResult {
+                                        tool_use_id: tool_call.id.clone(),
+                                        content: format!(
+                                            "Tool '{}' timed out after {}s.",
+                                            tool_call.name, timeout_secs
+                                        ),
+                                        is_error: true,
+                                    }
+                                }
                             }
                         }
+                        None => exec_fut.await,
                     };
 
                     // Fire AfterToolCall hook
@@ -2110,6 +2274,7 @@ pub async fn run_agent_loop_streaming(
                 let tool_results_msg = Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_result_blocks.clone()),
+                    ..Default::default()
                 };
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
@@ -2127,7 +2292,12 @@ pub async fn run_agent_loop_streaming(
                     } else {
                         text
                     };
-                    session.messages.push(Message::assistant(&text));
+                    // Issue #1148: preserve Thinking / RedactedThinking blocks
+                    // present in the response so reasoning state survives
+                    // MaxTokens truncation — same as the EndTurn branch.
+                    let assistant_msg =
+                        build_assistant_message_preserving_thinking(&response.content, &text);
+                    session.messages.push(assistant_msg);
                     if let Err(e) = memory.save_session_async(session).await {
                         warn!("Failed to save session on max continuations: {e}");
                     }
@@ -2158,9 +2328,14 @@ pub async fn run_agent_loop_streaming(
                         directives: Default::default(),
                     });
                 }
+                // Issue #1148: preserve full response content (Thinking,
+                // RedactedThinking, etc.) so reasoning state is not dropped
+                // when continuing across the token-limit boundary.
                 let text = response.text();
-                session.messages.push(Message::assistant(&text));
-                messages.push(Message::assistant(&text));
+                let assistant_msg =
+                    build_assistant_message_preserving_thinking(&response.content, &text);
+                session.messages.push(assistant_msg.clone());
+                messages.push(assistant_msg);
                 session.messages.push(Message::user("Please continue."));
                 messages.push(Message::user("Please continue."));
                 warn!(iteration, "Max tokens hit (streaming), continuing");
@@ -3064,6 +3239,189 @@ mod tests {
         assert_eq!(MAX_ITERATIONS, 50);
     }
 
+    /// Issue #1098: when a response carries Thinking blocks, the persisted
+    /// assistant turn must keep them so the next turn round-trips reasoning
+    /// state to the model.
+    #[test]
+    fn test_build_assistant_message_preserves_thinking() {
+        let response_blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "Let me reason carefully...".to_string(),
+                signature: Some("sig_anthropic_xyz".to_string()),
+                provider_metadata: Some(serde_json::json!({
+                    "format": "anthropic_extended_thinking"
+                })),
+            },
+            ContentBlock::Text {
+                text: "Initial response text".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        // Final text might differ from the original Text block (phantom-action
+        // recovery / synthesis fallback rewrites it). The helper should adopt
+        // final_text into the persisted Text block.
+        let final_text = "Initial response text";
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, final_text);
+        assert_eq!(msg.role, Role::Assistant);
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            other => panic!("expected blocks, got {other:?}"),
+        };
+        assert_eq!(blocks.len(), 2, "must preserve thinking + text");
+        match &blocks[0] {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                ..
+            } => {
+                assert_eq!(thinking, "Let me reason carefully...");
+                assert_eq!(signature.as_deref(), Some("sig_anthropic_xyz"));
+            }
+            _ => panic!("expected Thinking first"),
+        }
+        match &blocks[1] {
+            ContentBlock::Text { text, .. } => assert_eq!(text, "Initial response text"),
+            _ => panic!("expected Text second"),
+        }
+    }
+
+    /// Without thinking, fall back to the legacy `Message::assistant(text)`
+    /// shape so existing JSONL mirrors and embeddings keep working.
+    #[test]
+    fn test_build_assistant_message_no_thinking_is_plain_text() {
+        let response_blocks = vec![ContentBlock::Text {
+            text: "Hi.".to_string(),
+            provider_metadata: None,
+        }];
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, "Hi.");
+        match msg.content {
+            MessageContent::Text(t) => assert_eq!(t, "Hi."),
+            _ => panic!("expected plain text content for non-thinking responses"),
+        }
+    }
+
+    /// Final text supplied by the loop (e.g. recovery stub) must replace
+    /// the original text part — the persisted message reflects what was
+    /// actually returned to the user, not the raw LLM output.
+    #[test]
+    fn test_build_assistant_message_final_text_replaces_original_text() {
+        let response_blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "deliberation".to_string(),
+                signature: None,
+                provider_metadata: Some(serde_json::json!({"format": "inline_think"})),
+            },
+            ContentBlock::Text {
+                text: "raw LLM output".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        let final_text = "[Task completed — recovered after empty response.]";
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, final_text);
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            _ => panic!("expected blocks"),
+        };
+        let saved_text = blocks.iter().find_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(saved_text, Some(final_text));
+    }
+
+    /// Issue #1148 — when the LLM hits MaxTokens, the persisted assistant
+    /// turn must keep `Thinking` and `RedactedThinking` blocks so reasoning
+    /// state survives across the token-limit boundary. The helper used by
+    /// the MaxTokens branches is the same `build_assistant_message_preserving_thinking`
+    /// that EndTurn uses; this test pins that contract for both block types
+    /// so the four MaxTokens persistence sites stay correct.
+    #[test]
+    fn test_build_assistant_message_preserves_redacted_thinking_for_max_tokens() {
+        let response_blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "Mid-stream reasoning".to_string(),
+                signature: Some("sig_xyz".to_string()),
+                provider_metadata: Some(serde_json::json!({
+                    "format": "anthropic_extended_thinking"
+                })),
+            },
+            ContentBlock::RedactedThinking {
+                data: "encrypted_blob_abc".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Partial answer before token limit".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        let final_text = "Partial answer before token limit";
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, final_text);
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            other => panic!("expected Blocks content for MaxTokens persistence, got {other:?}"),
+        };
+
+        // All reasoning blocks must survive the persistence step so the
+        // follow-up "Please continue." turn carries them back to the model.
+        let has_thinking = blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+        let has_redacted = blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::RedactedThinking { .. }));
+        assert!(
+            has_thinking,
+            "Thinking block must be preserved on MaxTokens"
+        );
+        assert!(
+            has_redacted,
+            "RedactedThinking block must be preserved on MaxTokens"
+        );
+
+        // Verify the opaque blob is byte-identical (Anthropic rejects altered data).
+        for b in blocks {
+            if let ContentBlock::RedactedThinking { data } = b {
+                assert_eq!(data, "encrypted_blob_abc");
+            }
+        }
+
+        // Final text reflects what the user will see.
+        let saved_text = blocks.iter().find_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(saved_text, Some(final_text));
+    }
+
+    /// Issue #1187 — a turn that contains only `RedactedThinking` (no
+    /// `Thinking` block) must still trigger the block-preserving path. The
+    /// previous gate keyed solely on `Thinking`, so redacted-only turns were
+    /// downgraded to plain text and the encrypted blob was lost on the next
+    /// request, which Anthropic/Bedrock reject.
+    #[test]
+    fn test_build_assistant_message_preserves_redacted_only() {
+        let response_blocks = vec![
+            ContentBlock::RedactedThinking {
+                data: "encrypted_only".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Answer".to_string(),
+                provider_metadata: None,
+            },
+        ];
+        let msg = build_assistant_message_preserving_thinking(&response_blocks, "Answer");
+        let blocks = match &msg.content {
+            MessageContent::Blocks(b) => b,
+            other => panic!("expected Blocks content for redacted-only turn, got {other:?}"),
+        };
+        let has_redacted = blocks.iter().any(
+            |b| matches!(b, ContentBlock::RedactedThinking { data } if data == "encrypted_only"),
+        );
+        assert!(
+            has_redacted,
+            "RedactedThinking-only turn must be preserved as Blocks"
+        );
+    }
+
     #[test]
     fn test_retry_constants() {
         assert_eq!(MAX_RETRIES, 3);
@@ -3115,17 +3473,200 @@ mod tests {
         assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
     }
 
+    /// All `tool_timeout_for` cases live in one test (defaults plus env
+    /// overrides) to avoid env-var races between parallel test threads.
+    /// Issue #1125: operators on slow local inference (vLLM on old GPUs) need
+    /// to disable or extend the inter-agent timeout via env var.
     #[test]
     fn test_tool_timeout_for_agent_tools() {
-        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(600));
-        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
-        assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
-        assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
+        // Baseline: no env overrides → compiled-in defaults.
+        std::env::remove_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS");
+        std::env::remove_var("OPENFANG_TOOL_TIMEOUT_SECS");
+        assert_eq!(
+            tool_timeout_for("agent_send"),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            tool_timeout_for("agent_spawn"),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            tool_timeout_for("file_read"),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            tool_timeout_for("shell_exec"),
+            Some(Duration::from_secs(120))
+        );
+
+        // Override: set to 0 → timeout disabled.
+        std::env::set_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS", "0");
+        std::env::set_var("OPENFANG_TOOL_TIMEOUT_SECS", "0");
+        assert_eq!(tool_timeout_for("agent_send"), None);
+        assert_eq!(tool_timeout_for("agent_spawn"), None);
+        assert_eq!(tool_timeout_for("file_read"), None);
+
+        // Override: custom positive values are honored verbatim.
+        std::env::set_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS", "1800");
+        std::env::set_var("OPENFANG_TOOL_TIMEOUT_SECS", "300");
+        assert_eq!(
+            tool_timeout_for("agent_send"),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            tool_timeout_for("file_read"),
+            Some(Duration::from_secs(300))
+        );
+
+        // Override: unparseable values fall back to compiled-in defaults.
+        std::env::set_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS", "not-a-number");
+        std::env::set_var("OPENFANG_TOOL_TIMEOUT_SECS", "");
+        assert_eq!(
+            tool_timeout_for("agent_send"),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            tool_timeout_for("file_read"),
+            Some(Duration::from_secs(120))
+        );
+
+        std::env::remove_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS");
+        std::env::remove_var("OPENFANG_TOOL_TIMEOUT_SECS");
     }
 
     #[test]
     fn test_max_history_messages() {
         assert_eq!(MAX_HISTORY_MESSAGES, 20);
+        assert_eq!(
+            openfang_types::agent::DEFAULT_MAX_HISTORY_MESSAGES,
+            MAX_HISTORY_MESSAGES
+        );
+    }
+
+    /// Issue #871: an agent with a manifest override uses that value.
+    #[test]
+    fn test_effective_max_history_uses_manifest_override() {
+        let mut manifest = openfang_types::agent::AgentManifest {
+            max_history_messages: Some(40),
+            ..Default::default()
+        };
+        assert_eq!(manifest.effective_max_history_messages(), 40);
+
+        manifest.max_history_messages = Some(6);
+        assert_eq!(manifest.effective_max_history_messages(), 6);
+    }
+
+    /// Issue #871: an agent without an override falls back to the runtime
+    /// default. `Some(0)` is also treated as the default to avoid an agent
+    /// accidentally disabling history entirely.
+    #[test]
+    fn test_effective_max_history_falls_back_to_default() {
+        let mut manifest = openfang_types::agent::AgentManifest {
+            max_history_messages: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            manifest.effective_max_history_messages(),
+            MAX_HISTORY_MESSAGES
+        );
+
+        manifest.max_history_messages = Some(0);
+        assert_eq!(
+            manifest.effective_max_history_messages(),
+            MAX_HISTORY_MESSAGES
+        );
+    }
+
+    /// Issue #871: `max_history_messages` round-trips through serde with
+    /// `#[serde(default)]`, so manifests without the field still deserialize.
+    #[test]
+    fn test_manifest_max_history_round_trip_json() {
+        let json_no_override = r#"{"name":"worker","module":"builtin:chat"}"#;
+        let manifest: openfang_types::agent::AgentManifest =
+            serde_json::from_str(json_no_override).unwrap();
+        assert_eq!(manifest.max_history_messages, None);
+        assert_eq!(
+            manifest.effective_max_history_messages(),
+            MAX_HISTORY_MESSAGES
+        );
+
+        let json_with_override =
+            r#"{"name":"orchestrator","module":"builtin:chat","max_history_messages":40}"#;
+        let manifest: openfang_types::agent::AgentManifest =
+            serde_json::from_str(json_with_override).unwrap();
+        assert_eq!(manifest.max_history_messages, Some(40));
+        assert_eq!(manifest.effective_max_history_messages(), 40);
+    }
+
+    fn sample_image_block() -> ContentBlock {
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_only() {
+        let msg = build_user_turn_message("hello", None);
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hello"),
+            MessageContent::Blocks(_) => panic!("expected Text content for text-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_images_only() {
+        let msg = build_user_turn_message("", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for images-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_and_images_combined() {
+        let msg =
+            build_user_turn_message("what is in this image?", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2, "text must be combined with images");
+                match &blocks[0] {
+                    ContentBlock::Text { text, .. } => {
+                        assert_eq!(text, "what is in this image?");
+                    }
+                    _ => panic!("expected first block to be user text"),
+                }
+                assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for multimodal turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_whitespace_text_treated_as_empty() {
+        let msg = build_user_turn_message("   \n", Some(vec![sample_image_block()]));
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_empty_blocks_falls_back_to_text() {
+        let msg = build_user_turn_message("hi", Some(Vec::new()));
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hi"),
+            MessageContent::Blocks(_) => panic!("expected Text content when blocks are empty"),
+        }
     }
 
     // --- Integration tests for empty response guards ---

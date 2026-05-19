@@ -5,13 +5,26 @@
 version: "3.8"
 services:
   openfang:
-    # build: .
-    image: loscoy/openfang:dev
+    build: .
+    # image: ghcr.io/rightnow-ai/openfang:latest  # Uncomment when GHCR is public
     ports:
       - "4200:4200"
     volumes:
-      - ~/.openfang-data:/data
-      - ./config.toml:/data/config.toml
+      - openfang-data:/data
+    # Uncomment to reach host services (Ollama, whisper.cpp, local Postgres)
+    # from inside the container. Required on Linux and colima. See
+    # docs/troubleshooting.md#connecting-to-host-services-from-docker.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
     restart: unless-stopped
+
+volumes:
+  openfang-data:

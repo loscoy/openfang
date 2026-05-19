@@ -312,6 +312,12 @@ tr:hover td { background: var(--surface2); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
+/* Issue #1026: live indicator for agents currently calling the LLM */
+@keyframes agent-inferencing-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 var(--accent); }
+  50% { transform: scale(1.25); opacity: 0.85; box-shadow: 0 0 0 4px rgba(255, 92, 0, 0); }
+}
+
 .message.user {
   flex-direction: row-reverse;
 }
@@ -3253,7 +3259,7 @@ mark.search-highlight {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 .trader-dashboard {
-  background: var(--bg-card);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
   width: 96vw;
@@ -3270,7 +3276,7 @@ mark.search-highlight {
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
-  background: var(--bg-card);
+  background: var(--surface);
   z-index: 10;
   border-radius: 12px 12px 0 0;
 }
@@ -3330,6 +3336,7 @@ mark.search-highlight {
   border-radius: 8px;
   padding: 14px 16px;
   min-width: 0;
+  position: relative;
 }
 .trader-chart-title {
   font-size: 0.75rem;

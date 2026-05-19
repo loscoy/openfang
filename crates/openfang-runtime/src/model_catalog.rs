@@ -10,8 +10,8 @@ use openfang_types::model_catalog::{
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
     OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
+    REPLICATE_BASE_URL, REQUESTY_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL,
+    VLLM_BASE_URL, VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::collections::HashMap;
@@ -185,7 +185,7 @@ impl ModelCatalog {
             return self.models.iter().find(|m| m.id == *canonical);
         }
         // Strip "provider/" prefix (e.g. "openai/gpt-4o" → "gpt-4o") and retry
-        if let Some(model_part) = id_or_alias.splitn(2, '/').nth(1) {
+        if let Some(model_part) = id_or_alias.split_once('/').map(|x| x.1) {
             return self.find_model(model_part);
         }
         None
@@ -340,6 +340,27 @@ impl ModelCatalog {
             // Re-detect auth for the newly added provider
             self.detect_auth();
             true
+        }
+    }
+
+    /// Apply environment-variable URL overrides for local providers.
+    ///
+    /// Honours the same env vars the drivers respect (see
+    /// `drivers::local_provider_url_from_env`): `OLLAMA_HOST` / `OLLAMA_BASE_URL`,
+    /// `LMSTUDIO_HOST` / `LMSTUDIO_BASE_URL`, `VLLM_HOST` / `VLLM_BASE_URL`,
+    /// `LEMONADE_HOST` / `LEMONADE_BASE_URL`. This keeps the dashboard's
+    /// "Providers" view in sync with what the driver actually connects to,
+    /// without requiring users to edit `config.toml` for remote local-LLM hosts
+    /// (VPS, LXC, LAN). See issue #1154.
+    pub fn apply_local_env_overrides(&mut self) {
+        for provider in ["ollama", "lmstudio", "vllm", "lemonade"] {
+            if let Some(url) = crate::drivers::local_provider_url_from_env(provider) {
+                if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider) {
+                    p.base_url = url;
+                    // A custom host indicates intentional setup, surface it as configured.
+                    p.auth_status = AuthStatus::Configured;
+                }
+            }
         }
     }
 
@@ -604,6 +625,15 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             display_name: "OpenRouter".into(),
             api_key_env: "OPENROUTER_API_KEY".into(),
             base_url: OPENROUTER_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
+        ProviderInfo {
+            id: "requesty".into(),
+            display_name: "Requesty".into(),
+            api_key_env: "REQUESTY_API_KEY".into(),
+            base_url: REQUESTY_BASE_URL.into(),
             key_required: true,
             auth_status: AuthStatus::Missing,
             model_count: 0,
@@ -1016,13 +1046,21 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("qwen-coder", "qwen-code/qwen3-coder"),
         ("qwen-coder-plus", "qwen-code/qwen-coder-plus"),
         ("qwq", "qwen-code/qwq-32b"),
-        // OpenRouter free-tier aliases
+        // OpenRouter free-tier aliases. Point to free models that actually support
+        // tool calling on OpenRouter's free endpoints — agents send tool definitions
+        // by default, so a non-tool model returns "No endpoints found that support
+        // tool use" (issue #1032).
         (
             "openrouter/free",
-            "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
         ),
-        ("free", "openrouter/meta-llama/llama-3.1-8b-instruct:free"),
+        ("free", "openrouter/meta-llama/llama-3.3-70b-instruct:free"),
         ("free-reasoning", "openrouter/deepseek/deepseek-r1:free"),
+        ("openrouter/free-coder", "openrouter/qwen/qwen3-coder:free"),
+        (
+            "openrouter/free-large",
+            "openrouter/openai/gpt-oss-120b:free",
+        ),
     ];
     pairs
         .into_iter()
@@ -1725,7 +1763,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // OpenRouter (10) — pass-through models using real upstream IDs
+        // OpenRouter (15+) — pass-through models using real upstream IDs
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "openrouter/google/gemini-2.5-flash".into(),
@@ -1883,8 +1921,87 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         ModelCatalogEntry {
+            // NOTE: OpenRouter's free endpoint for this model rejects tool-use
+            // requests ("No endpoints found that support tool use"), so we mark
+            // it as no-tool to keep agents from sending tool definitions to it.
+            // The paid version of llama-3.1-8b-instruct does support tools.
             id: "openrouter/meta-llama/llama-3.1-8b-instruct:free".into(),
             display_name: "Llama 3.1 8B Free (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Fast,
+            context_window: 131_072,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            // Same caveat as above — OpenRouter's free 7B endpoint has no tool
+            // support; use qwen3-coder:free for tool-using free workloads.
+            id: "openrouter/qwen/qwen-2.5-7b-instruct:free".into(),
+            display_name: "Qwen 2.5 7B Free (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Fast,
+            context_window: 32_768,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        // Free models that DO support tool calling on OpenRouter's free tier.
+        // Verified against `GET https://openrouter.ai/api/v1/models` —
+        // `supported_parameters` includes "tools" for these IDs.
+        ModelCatalogEntry {
+            id: "openrouter/meta-llama/llama-3.3-70b-instruct:free".into(),
+            display_name: "Llama 3.3 70B Free (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Balanced,
+            context_window: 65_536,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "openrouter/qwen/qwen3-coder:free".into(),
+            display_name: "Qwen3 Coder Free (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Smart,
+            context_window: 262_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "openrouter/openai/gpt-oss-120b:free".into(),
+            display_name: "GPT-OSS 120B Free (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Smart,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "openrouter/openai/gpt-oss-20b:free".into(),
+            display_name: "GPT-OSS 20B Free (OpenRouter)".into(),
             provider: "openrouter".into(),
             tier: ModelTier::Fast,
             context_window: 131_072,
@@ -1897,12 +2014,12 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         ModelCatalogEntry {
-            id: "openrouter/qwen/qwen-2.5-7b-instruct:free".into(),
-            display_name: "Qwen 2.5 7B Free (OpenRouter)".into(),
+            id: "openrouter/z-ai/glm-4.5-air:free".into(),
+            display_name: "GLM 4.5 Air Free (OpenRouter)".into(),
             provider: "openrouter".into(),
-            tier: ModelTier::Fast,
-            context_window: 32_768,
-            max_output_tokens: 4_096,
+            tier: ModelTier::Smart,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
             input_cost_per_m: 0.0,
             output_cost_per_m: 0.0,
             supports_tools: true,
@@ -1965,6 +2082,80 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_vision: false,
             supports_streaming: true,
             aliases: vec!["hunter-alpha".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // Requesty (5) — router-style OpenAI-compatible gateway (issue #995)
+        // Hundreds of upstream models accessible via https://router.requesty.ai/v1
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "requesty/anthropic/claude-sonnet-4".into(),
+            display_name: "Claude Sonnet 4 (Requesty)".into(),
+            provider: "requesty".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            input_cost_per_m: 3.0,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "requesty/openai/gpt-4o".into(),
+            display_name: "GPT-4o (Requesty)".into(),
+            provider: "requesty".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 2.5,
+            output_cost_per_m: 10.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "requesty/google/gemini-2.5-flash".into(),
+            display_name: "Gemini 2.5 Flash (Requesty)".into(),
+            provider: "requesty".into(),
+            tier: ModelTier::Smart,
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.15,
+            output_cost_per_m: 0.60,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "requesty/deepseek/deepseek-chat".into(),
+            display_name: "DeepSeek V3 (Requesty)".into(),
+            provider: "requesty".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.14,
+            output_cost_per_m: 0.28,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "requesty/meta-llama/llama-3.3-70b-instruct".into(),
+            display_name: "Llama 3.3 70B (Requesty)".into(),
+            provider: "requesty".into(),
+            tier: ModelTier::Balanced,
+            context_window: 128_000,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.39,
+            output_cost_per_m: 0.39,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
         // Mistral (6)
@@ -3896,7 +4087,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 41);
+        assert_eq!(catalog.list_providers().len(), 42);
     }
 
     #[test]
@@ -4513,5 +4704,167 @@ mod tests {
             .unwrap();
         assert_eq!(found.provider, "custom_provider");
         assert_eq!(found.id, "My-Custom-LLM");
+    }
+
+    // ── OpenRouter free-tier fixes (issue #1032) ──────────────────────────
+
+    /// `openrouter/free` and `free` aliases must point to a free model that
+    /// actually supports tool calling on OpenRouter's free endpoints.
+    /// Previously they pointed to `llama-3.1-8b-instruct:free`, which OpenRouter
+    /// rejects with "No endpoints found that support tool use" when agents
+    /// send tool definitions.
+    #[test]
+    fn test_openrouter_free_alias_supports_tools() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog
+            .find_model("openrouter/free")
+            .expect("openrouter/free alias must resolve to a known model");
+        assert_eq!(entry.provider, "openrouter");
+        assert!(
+            entry.supports_tools,
+            "openrouter/free must resolve to a tool-capable model (issue #1032). \
+             Resolved to {} which has supports_tools=false",
+            entry.id
+        );
+    }
+
+    #[test]
+    fn test_openrouter_free_short_alias_supports_tools() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog.find_model("free").expect("free alias must resolve");
+        assert_eq!(entry.provider, "openrouter");
+        assert!(
+            entry.supports_tools,
+            "`free` alias must resolve to a tool-capable model"
+        );
+    }
+
+    /// Confirm the resolved free model's ID is one of the verified
+    /// tool-supporting free endpoints on OpenRouter.
+    #[test]
+    fn test_openrouter_free_alias_target() {
+        let catalog = ModelCatalog::new();
+        let resolved = catalog
+            .resolve_alias("openrouter/free")
+            .expect("alias must exist");
+        // Must be one of the known-good free models with tool support.
+        let known_good = [
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/qwen/qwen3-coder:free",
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/openai/gpt-oss-20b:free",
+            "openrouter/z-ai/glm-4.5-air:free",
+        ];
+        assert!(
+            known_good.contains(&resolved),
+            "openrouter/free resolves to {}, expected one of: {:?}",
+            resolved,
+            known_good
+        );
+    }
+
+    /// New free-tier tool-using models are present in the catalog.
+    #[test]
+    fn test_openrouter_free_tool_models_present() {
+        let catalog = ModelCatalog::new();
+        for id in [
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/qwen/qwen3-coder:free",
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/openai/gpt-oss-20b:free",
+            "openrouter/z-ai/glm-4.5-air:free",
+        ] {
+            let entry = catalog
+                .find_model(id)
+                .unwrap_or_else(|| panic!("missing free model {}", id));
+            assert_eq!(entry.provider, "openrouter");
+            assert!(entry.supports_tools, "{} must support tools", id);
+            assert_eq!(entry.input_cost_per_m, 0.0, "{} must be free", id);
+            assert_eq!(entry.output_cost_per_m, 0.0, "{} must be free", id);
+        }
+    }
+
+    /// Free models that OpenRouter's free endpoint does NOT route to a
+    /// tool-supporting backend must be marked `supports_tools=false` so
+    /// agents don't send tool defs that get rejected.
+    #[test]
+    fn test_openrouter_free_no_tool_models_marked() {
+        let catalog = ModelCatalog::new();
+        let llama8b = catalog
+            .find_model("openrouter/meta-llama/llama-3.1-8b-instruct:free")
+            .expect("model must exist");
+        assert!(
+            !llama8b.supports_tools,
+            "llama-3.1-8b-instruct:free has no tool-supporting free endpoint"
+        );
+        let qwen7b = catalog
+            .find_model("openrouter/qwen/qwen-2.5-7b-instruct:free")
+            .expect("model must exist");
+        assert!(
+            !qwen7b.supports_tools,
+            "qwen-2.5-7b-instruct:free has no tool-supporting free endpoint"
+        );
+    }
+
+    // ── Requesty provider (issue #995) ────────────────────────────────────
+
+    /// Requesty must be registered as a provider with the correct base URL
+    /// and env var, and at least one of its catalog models must resolve.
+    #[test]
+    fn test_requesty_provider_and_models_present() {
+        let catalog = ModelCatalog::new();
+
+        let provider = catalog
+            .list_providers()
+            .iter()
+            .find(|p| p.id == "requesty")
+            .expect("requesty provider must be registered");
+        assert_eq!(provider.display_name, "Requesty");
+        assert_eq!(provider.api_key_env, "REQUESTY_API_KEY");
+        assert_eq!(provider.base_url, "https://router.requesty.ai/v1");
+        assert!(provider.key_required);
+        assert!(
+            provider.model_count >= 1,
+            "requesty must have at least one model in catalog"
+        );
+
+        let entry = catalog
+            .find_model("requesty/anthropic/claude-sonnet-4")
+            .expect("requesty/anthropic/claude-sonnet-4 must resolve");
+        assert_eq!(entry.provider, "requesty");
+        assert!(entry.supports_tools);
+    }
+
+    // ── Issue #1154: env-var overrides for local provider URLs ──
+
+    /// Local guard so this catalog test doesn't clash with the driver tests
+    /// that touch the same env vars. We acquire the cross-module lock from
+    /// the drivers module to serialise.
+    #[test]
+    fn test_apply_local_env_overrides_ollama() {
+        // Serialise with driver-side env tests that touch OLLAMA_*.
+        let _lock = crate::drivers::env_lock_for_tests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_base = std::env::var_os("OLLAMA_BASE_URL");
+        let prev_host = std::env::var_os("OLLAMA_HOST");
+        std::env::remove_var("OLLAMA_BASE_URL");
+        std::env::set_var("OLLAMA_HOST", "172.16.0.10:11434");
+
+        let mut catalog = ModelCatalog::new();
+        catalog.apply_local_env_overrides();
+        let ollama = catalog.get_provider("ollama").unwrap();
+        assert_eq!(ollama.base_url, "http://172.16.0.10:11434/v1");
+        assert_eq!(ollama.auth_status, AuthStatus::Configured);
+
+        // Restore env
+        if let Some(v) = prev_base {
+            std::env::set_var("OLLAMA_BASE_URL", v);
+        }
+        if let Some(v) = prev_host {
+            std::env::set_var("OLLAMA_HOST", v);
+        } else {
+            std::env::remove_var("OLLAMA_HOST");
+        }
     }
 }

@@ -407,6 +407,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                             conversation_text.push_str(&format!("[Document: {media_type}]\n\n"));
                         }
                         ContentBlock::Thinking { .. } => {}
+                        ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Unknown => {}
                     }
                 }
@@ -438,10 +439,10 @@ async fn summarize_messages(
         let safe_start = if conversation_text.is_char_boundary(start) {
             start
         } else {
-            // Find the nearest valid character boundary moving upward   
-	        (start..conversation_text.len())
-	            .find(|&i| conversation_text.is_char_boundary(i))
-	            .unwrap_or(conversation_text.len())
+            // Find the nearest valid character boundary moving upward
+            (start..conversation_text.len())
+                .find(|&i| conversation_text.is_char_boundary(i))
+                .unwrap_or(conversation_text.len())
         };
         conversation_text = conversation_text[safe_start..].to_string();
     }
@@ -460,6 +461,7 @@ async fn summarize_messages(
                 text: summarize_prompt,
                 provider_metadata: None,
             }]),
+            ..Default::default()
         }],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
@@ -578,6 +580,7 @@ async fn summarize_in_chunks(
                 text: merge_prompt,
                 provider_metadata: None,
             }]),
+            ..Default::default()
         }],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
@@ -915,6 +918,7 @@ mod tests {
                 input: serde_json::json!({"query": "test"}),
                 provider_metadata: None,
             }]),
+            ..Default::default()
         };
         messages[2] = Message {
             role: Role::User,
@@ -924,6 +928,7 @@ mod tests {
                 content: "Search results here".to_string(),
                 is_error: false,
             }]),
+            ..Default::default()
         };
 
         let session = Session {
@@ -1254,6 +1259,7 @@ mod tests {
                         provider_metadata: None,
                     },
                 ]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1263,6 +1269,7 @@ mod tests {
                     content: "Results found".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1270,6 +1277,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data: "base64data".to_string(),
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -1404,6 +1412,7 @@ mod tests {
                 content: tool_content,
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         // The base64 blob should be stripped/replaced by session_repair
@@ -1424,6 +1433,7 @@ mod tests {
                 content: large_result,
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         // Should be capped at ~2000 chars (plus the "..." suffix)
@@ -1448,6 +1458,7 @@ mod tests {
                 content: short_result.to_string(),
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         assert!(text.contains(short_result));
@@ -1467,6 +1478,7 @@ mod tests {
                     input: serde_json::json!({}),
                     provider_metadata: None,
                 }]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1476,6 +1488,7 @@ mod tests {
                     content: "file contents".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
             Message::assistant("Done reading."),
         ];

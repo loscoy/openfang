@@ -143,6 +143,29 @@ function chatPage() {
       // Fetch dynamic commands from server
       this.fetchCommands();
 
+      // Observe DOM for new messages and render LaTeX
+      this._latexObserver = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+          mutation.addedNodes.forEach(function(node) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              var bubbles = node.querySelector ? node.querySelectorAll('.message-bubble') : [];
+              if (node.classList && node.classList.contains('message-bubble')) {
+                bubbles = [node];
+              }
+              bubbles.forEach(function(bubble) {
+                if (bubble.textContent && hasLatexDelimiters(bubble.textContent)) {
+                  renderLatex(bubble);
+                }
+              });
+            }
+          });
+        });
+      });
+      this._latexObserver.observe(document.getElementById('messages') || document.body, {
+        childList: true,
+        subtree: true
+      });
+
       // Ctrl+/ keyboard shortcut
       document.addEventListener('keydown', function(e) {
         if ((e.ctrlKey || e.metaKey) && e.key === '/') {
@@ -175,6 +198,10 @@ function chatPage() {
       if (store.pendingAgent) {
         self.selectAgent(store.pendingAgent);
         store.pendingAgent = null;
+      } else {
+        // Restore previously active agent after page refresh (#1179).
+        // The agent list may not be loaded yet, so resolve once it appears.
+        self._restoreActiveAgent();
       }
 
       // Watch for future pending agent selections (e.g., user clicks agent while on chat)
@@ -182,6 +209,13 @@ function chatPage() {
         if (agent) {
           self.selectAgent(agent);
           Alpine.store('app').pendingAgent = null;
+        }
+      });
+
+      // Re-attempt restore once the agent list arrives from the server
+      this.$watch('$store.app.agents', function(agents) {
+        if (!self.currentAgent && agents && agents.length) {
+          self._restoreActiveAgent();
         }
       });
 
@@ -304,22 +338,38 @@ function chatPage() {
       this._slashCommandsLoaded = true;
     },
 
-    // Fetch dynamic slash commands from server
+    // Fetch slash commands from the unified registry (/api/commands?surface=web).
+    // Replaces the hardcoded initSlashCommands() list once loaded — ensures
+    // the help panel and autocomplete stay in sync with the backend registry.
     fetchCommands: function() {
       var self = this;
-      OpenFangAPI.get('/api/commands').then(function(data) {
-        if (data.commands && data.commands.length) {
-          // Build a set of known cmds to avoid duplicates
-          var existing = {};
-          self.slashCommands.forEach(function(c) { existing[c.cmd] = true; });
-          data.commands.forEach(function(c) {
-            if (!existing[c.cmd]) {
-              self.slashCommands.push({ cmd: c.cmd, desc: c.desc || '', source: c.source || 'server' });
-              existing[c.cmd] = true;
-            }
-          });
-        }
-      }).catch(function() { /* silent — use hardcoded list */ });
+      OpenFangAPI.get('/api/commands?surface=web').then(function(data) {
+        var cmds = (data && data.commands) || [];
+        if (!cmds.length) return;
+        self.slashCommands = cmds.map(function(c) {
+          // Prefer unified-registry shape { name, aliases, description, category, requires_agent }.
+          // Fall back to legacy { cmd, desc } shape so older shims keep working.
+          if (c.name) {
+            return {
+              cmd: '/' + c.name,
+              desc: c.description || '',
+              category: c.category || 'general',
+              aliases: c.aliases || [],
+              requires_agent: !!c.requires_agent,
+              source: 'registry'
+            };
+          }
+          return {
+            cmd: c.cmd,
+            desc: c.desc || '',
+            category: c.category || 'general',
+            aliases: c.aliases || [],
+            requires_agent: !!c.requires_agent,
+            source: c.source || 'server'
+          };
+        });
+        self._slashCommandsLoaded = true;
+      }).catch(function() { /* silent — keep hardcoded fallback list */ });
     },
 
     get filteredSlashCommands() {
@@ -328,6 +378,44 @@ function chatPage() {
       return this.slashCommands.filter(function(c) {
         return c.cmd.toLowerCase().indexOf(f) !== -1 || c.desc.toLowerCase().indexOf(f) !== -1;
       });
+    },
+
+    // Render `/help` output grouped by category, mirroring the
+    // backend's render_help(Surfaces::WEB). Falls back to a flat list if
+    // categories are not populated (pre-fetch hardcoded list).
+    renderHelpText: function() {
+      var order = ['general', 'session', 'model', 'control', 'memory', 'info', 'automation', 'monitoring'];
+      var labels = {
+        general: 'General', session: 'Session', model: 'Model', control: 'Control',
+        memory: 'Memory', info: 'Info', automation: 'Automation', monitoring: 'Monitoring'
+      };
+      var anyCategorised = this.slashCommands.some(function(c) { return c.category; });
+      if (!anyCategorised) {
+        return this.slashCommands.map(function(c) {
+          return '`' + c.cmd + '` \u2014 ' + c.desc;
+        }).join('\n');
+      }
+      var groups = {};
+      this.slashCommands.forEach(function(c) {
+        var cat = c.category || 'general';
+        if (!groups[cat]) groups[cat] = [];
+        groups[cat].push(c);
+      });
+      var lines = ['**Available commands:**'];
+      order.forEach(function(cat) {
+        var list = groups[cat];
+        if (!list || !list.length) return;
+        lines.push('');
+        lines.push('**' + (labels[cat] || cat) + '**');
+        list.forEach(function(c) {
+          var aliasText = '';
+          if (c.aliases && c.aliases.length) {
+            aliasText = ' (aliases: ' + c.aliases.map(function(a) { return '/' + a; }).join(', ') + ')';
+          }
+          lines.push('- `' + c.cmd + '`' + aliasText + ' \u2014 ' + c.desc);
+        });
+      });
+      return lines.join('\n');
     },
 
     // Clear any stuck typing indicator after 120s
@@ -355,7 +443,7 @@ function chatPage() {
       cmdArgs = cmdArgs || '';
       switch (cmd) {
         case '/help':
-          self.messages.push({ id: ++msgId, role: 'system', text: self.slashCommands.map(function(c) { return '`' + c.cmd + '` — ' + c.desc; }).join('\n'), meta: '', tools: [] });
+          self.messages.push({ id: ++msgId, role: 'system', text: self.renderHelpText(), meta: '', tools: [] });
           self.scrollToBottom();
           break;
         case '/agents':
@@ -419,7 +507,7 @@ function chatPage() {
           if (self.currentAgent && OpenFangAPI.isWsConnected()) {
             OpenFangAPI.wsSend({ type: 'command', command: 'context', args: '' });
           } else {
-            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected. Connect to an agent first.', meta: '', tools: [] });
+            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected (' + (OpenFangAPI.getConnectionState ? OpenFangAPI.getConnectionState() : 'unknown') + '). Pick an agent or check that your session is still valid.', meta: '', tools: [] });
             self.scrollToBottom();
           }
           break;
@@ -427,7 +515,7 @@ function chatPage() {
           if (self.currentAgent && OpenFangAPI.isWsConnected()) {
             OpenFangAPI.wsSend({ type: 'command', command: 'verbose', args: cmdArgs });
           } else {
-            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected. Connect to an agent first.', meta: '', tools: [] });
+            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected (' + (OpenFangAPI.getConnectionState ? OpenFangAPI.getConnectionState() : 'unknown') + '). Pick an agent or check that your session is still valid.', meta: '', tools: [] });
             self.scrollToBottom();
           }
           break;
@@ -435,7 +523,7 @@ function chatPage() {
           if (self.currentAgent && OpenFangAPI.isWsConnected()) {
             OpenFangAPI.wsSend({ type: 'command', command: 'queue', args: '' });
           } else {
-            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected.', meta: '', tools: [] });
+            self.messages.push({ id: ++msgId, role: 'system', text: 'Not connected (' + (OpenFangAPI.getConnectionState ? OpenFangAPI.getConnectionState() : 'unknown') + ').', meta: '', tools: [] });
             self.scrollToBottom();
           }
           break;
@@ -474,6 +562,7 @@ function chatPage() {
           self._wsAgent = null;
           self.currentAgent = null;
           self.messages = [];
+          try { localStorage.removeItem('of-active-agent'); } catch(e) { /* ignore */ }
           window.dispatchEvent(new Event('close-chat'));
           break;
         case '/budget':
@@ -509,9 +598,27 @@ function chatPage() {
       }
     },
 
+    // Restore the previously-active agent (set in selectAgent) after a page
+    // refresh, so the WebSocket re-attaches to the same session and any
+    // in-flight tool output streams back into the chat (#1179).
+    _restoreActiveAgent: function() {
+      var storedId = null;
+      try { storedId = localStorage.getItem('of-active-agent'); } catch(e) { /* ignore */ }
+      if (!storedId) return;
+      var agents = (Alpine.store('app') && Alpine.store('app').agents) || [];
+      var match = null;
+      for (var i = 0; i < agents.length; i++) {
+        if (agents[i] && agents[i].id === storedId) { match = agents[i]; break; }
+      }
+      if (match) {
+        this.selectAgent(match);
+      }
+    },
+
     selectAgent(agent) {
       this.currentAgent = agent;
       this.messages = [];
+      try { localStorage.setItem('of-active-agent', agent.id); } catch(e) { /* ignore */ }
       this.connectWs(agent.id);
       var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       // Show welcome tips on first use
@@ -640,6 +747,15 @@ function chatPage() {
     handleWsMessage(data) {
       switch (data.type) {
         case 'connected': break;
+
+        // Incoming message from server (e.g., cron trigger) — display as user message
+        case 'message':
+          if (data.content) {
+            var meta = data.source === 'cron' ? '[Scheduled: ' + (data.job_name || data.job_id || '') + ']' : '';
+            this.messages.push({ id: ++msgId, role: 'user', text: data.content, meta: meta, tools: [], images: [], ts: Date.now() });
+            this.scrollToBottom();
+          }
+          break;
 
         // Legacy thinking event (backward compat)
         case 'thinking':
@@ -1087,12 +1203,44 @@ function chatPage() {
           self._wsAgent = null;
           self.currentAgent = null;
           self.messages = [];
+          try { localStorage.removeItem('of-active-agent'); } catch(e) { /* ignore */ }
           OpenFangToast.success(t('chat.agent_stopped') + ' "' + name + '"');
           Alpine.store('app').refreshAgents();
         } catch(e) {
           OpenFangToast.error(t('chat.stop_agent_failed') + ': ' + e.message);
         }
       });
+    },
+
+    // Permanently uninstall the agent: kill + remove ~/.openfang/agents/<name>/
+    // Issue #1163.
+    uninstallAgent: function() {
+      if (!this.currentAgent) return;
+      var self = this;
+      var name = this.currentAgent.name;
+      var agentId = this.currentAgent.id;
+      OpenFangToast.confirm(
+        'Uninstall Agent',
+        'Uninstall agent "' + name + '"? This stops the agent AND deletes its files from your workspace. This cannot be undone.',
+        async function() {
+          try {
+            var res = await OpenFangAPI.del('/api/agents/' + agentId + '/uninstall');
+            OpenFangAPI.wsDisconnect();
+            self._wsAgent = null;
+            self.currentAgent = null;
+            self.messages = [];
+            try { localStorage.removeItem('of-active-agent'); } catch(e) { /* ignore */ }
+            var msg = 'Agent "' + name + '" uninstalled';
+            if (res && res.dir_removed === false) {
+              msg += ' (no on-disk files found)';
+            }
+            OpenFangToast.success(msg);
+            Alpine.store('app').refreshAgents();
+          } catch(e) {
+            OpenFangToast.error('Failed to uninstall agent: ' + e.message);
+          }
+        }
+      );
     },
 
     _latexTimer: null,

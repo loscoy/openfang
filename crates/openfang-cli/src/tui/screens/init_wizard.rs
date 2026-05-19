@@ -149,6 +149,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         hint: "",
     },
     ProviderInfo {
+        name: "minimax",
+        display: "MiniMax",
+        env_var: "MINIMAX_API_KEY",
+        default_model: "MiniMax-M2.7",
+        needs_key: true,
+        hint: "",
+    },
+    ProviderInfo {
         name: "huggingface",
         display: "Hugging Face",
         env_var: "HUGGINGFACE_API_KEY",
@@ -258,6 +266,23 @@ pub enum InitResult {
     Cancelled,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::PROVIDERS;
+
+    #[test]
+    fn init_wizard_lists_minimax_provider() {
+        let minimax = PROVIDERS.iter().find(|provider| provider.name == "minimax");
+        assert!(
+            minimax.is_some(),
+            "MiniMax should be selectable in openfang init"
+        );
+        let minimax = minimax.unwrap();
+        assert_eq!(minimax.env_var, "MINIMAX_API_KEY");
+        assert_eq!(minimax.default_model, "MiniMax-M2.7");
+    }
+}
+
 // ── Internal state ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -312,7 +337,10 @@ enum CopilotAuthStatus {
 }
 
 enum CopilotAuthEvent {
-    DeviceCode { user_code: String, verification_uri: String },
+    DeviceCode {
+        user_code: String,
+        verification_uri: String,
+    },
     Authenticated,
     Models(Vec<String>),
 }
@@ -648,8 +676,7 @@ pub fn run() -> InitResult {
     let (test_tx, test_rx) = std::sync::mpsc::channel::<bool>();
     let (migrate_tx, migrate_rx) =
         std::sync::mpsc::channel::<Result<openfang_migrate::report::MigrationReport, String>>();
-    let (copilot_tx, copilot_rx) =
-        std::sync::mpsc::channel::<Result<CopilotAuthEvent, String>>();
+    let (copilot_tx, copilot_rx) = std::sync::mpsc::channel::<Result<CopilotAuthEvent, String>>();
 
     let result = loop {
         terminal
@@ -660,7 +687,10 @@ pub fn run() -> InitResult {
         if state.step == Step::CopilotAuth {
             while let Ok(event) = copilot_rx.try_recv() {
                 match event {
-                    Ok(CopilotAuthEvent::DeviceCode { user_code, verification_uri }) => {
+                    Ok(CopilotAuthEvent::DeviceCode {
+                        user_code,
+                        verification_uri,
+                    }) => {
                         state.copilot_user_code = user_code;
                         state.copilot_verification_uri = verification_uri;
                         state.copilot_auth_status = CopilotAuthStatus::WaitingForUser;
@@ -839,7 +869,8 @@ pub fn run() -> InitResult {
                                         let rt = match tokio::runtime::Runtime::new() {
                                             Ok(rt) => rt,
                                             Err(e) => {
-                                                let _ = copilot_tx.send(Err(format!("Runtime error: {e}")));
+                                                let _ = copilot_tx
+                                                    .send(Err(format!("Runtime error: {e}")));
                                                 return;
                                             }
                                         };
@@ -851,21 +882,31 @@ pub fn run() -> InitResult {
                                                 .map_err(|e| format!("HTTP error: {e}"));
                                             let http = match http {
                                                 Ok(h) => h,
-                                                Err(e) => { let _ = copilot_tx.send(Err(e)); return; }
+                                                Err(e) => {
+                                                    let _ = copilot_tx.send(Err(e));
+                                                    return;
+                                                }
                                             };
 
                                             // Step 1: request device code
                                             use openfang_runtime::drivers::copilot;
-                                            let device = match copilot::request_device_code(&http).await {
-                                                Ok(d) => d,
-                                                Err(e) => { let _ = copilot_tx.send(Err(e)); return; }
-                                            };
+                                            let device =
+                                                match copilot::request_device_code(&http).await {
+                                                    Ok(d) => d,
+                                                    Err(e) => {
+                                                        let _ = copilot_tx.send(Err(e));
+                                                        return;
+                                                    }
+                                                };
 
                                             // Send device code to TUI for display
-                                            let _ = copilot_tx.send(Ok(CopilotAuthEvent::DeviceCode {
-                                                user_code: device.user_code.clone(),
-                                                verification_uri: device.verification_uri.clone(),
-                                            }));
+                                            let _ =
+                                                copilot_tx.send(Ok(CopilotAuthEvent::DeviceCode {
+                                                    user_code: device.user_code.clone(),
+                                                    verification_uri: device
+                                                        .verification_uri
+                                                        .clone(),
+                                                }));
 
                                             // Browser will be opened by user pressing Enter in TUI
 
@@ -874,9 +915,14 @@ pub fn run() -> InitResult {
                                                 &http,
                                                 &device.device_code,
                                                 device.interval,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 Ok(t) => t,
-                                                Err(e) => { let _ = copilot_tx.send(Err(e)); return; }
+                                                Err(e) => {
+                                                    let _ = copilot_tx.send(Err(e));
+                                                    return;
+                                                }
                                             };
 
                                             // Save tokens
@@ -885,16 +931,38 @@ pub fn run() -> InitResult {
                                                 return;
                                             }
 
-                                            let _ = copilot_tx.send(Ok(CopilotAuthEvent::Authenticated));
+                                            let _ = copilot_tx
+                                                .send(Ok(CopilotAuthEvent::Authenticated));
 
                                             // Step 3: fetch models
-                                            let ct = match copilot::exchange_copilot_token(&http, &tokens.access_token).await {
+                                            let ct = match copilot::exchange_copilot_token(
+                                                &http,
+                                                &tokens.access_token,
+                                            )
+                                            .await
+                                            {
                                                 Ok(ct) => ct,
-                                                Err(e) => { let _ = copilot_tx.send(Err(format!("Token exchange: {e}"))); return; }
+                                                Err(e) => {
+                                                    let _ = copilot_tx
+                                                        .send(Err(format!("Token exchange: {e}")));
+                                                    return;
+                                                }
                                             };
-                                            match copilot::fetch_models(&http, &ct.base_url, &ct.token).await {
-                                                Ok(models) => { let _ = copilot_tx.send(Ok(CopilotAuthEvent::Models(models))); }
-                                                Err(e) => { let _ = copilot_tx.send(Err(format!("Model fetch: {e}"))); }
+                                            match copilot::fetch_models(
+                                                &http,
+                                                &ct.base_url,
+                                                &ct.token,
+                                            )
+                                            .await
+                                            {
+                                                Ok(models) => {
+                                                    let _ = copilot_tx
+                                                        .send(Ok(CopilotAuthEvent::Models(models)));
+                                                }
+                                                Err(e) => {
+                                                    let _ = copilot_tx
+                                                        .send(Err(format!("Model fetch: {e}")));
+                                                }
                                             }
                                         });
                                     });
@@ -923,14 +991,15 @@ pub fn run() -> InitResult {
                                 state.step = Step::Provider;
                             }
                         }
-                        KeyCode::Enter => {
-                            if matches!(state.copilot_auth_status, CopilotAuthStatus::WaitingForUser) {
-                                if !state.copilot_verification_uri.is_empty() {
-                                    let _ = openfang_runtime::drivers::copilot::open_verification_url(
-                                        &state.copilot_verification_uri,
-                                    );
-                                }
-                            }
+                        KeyCode::Enter
+                            if matches!(
+                                state.copilot_auth_status,
+                                CopilotAuthStatus::WaitingForUser
+                            ) && !state.copilot_verification_uri.is_empty() =>
+                        {
+                            let _ = openfang_runtime::drivers::copilot::open_verification_url(
+                                &state.copilot_verification_uri,
+                            );
                         }
                         _ => {}
                     },
@@ -945,41 +1014,36 @@ pub fn run() -> InitResult {
                                 state.key_test = KeyTestState::Idle;
                                 state.step = Step::Provider;
                             }
-                            KeyCode::Enter => {
+                            KeyCode::Enter
                                 if !state.api_key_input.is_empty()
-                                    && state.key_test == KeyTestState::Idle
-                                {
-                                    if let Some(p) = state.provider() {
-                                        let _ = crate::dotenv::save_env_key(
-                                            p.env_var,
-                                            &state.api_key_input,
-                                        );
-                                    }
-                                    state.key_test = KeyTestState::Testing;
-                                    let provider_name = state
-                                        .provider()
-                                        .map(|p| p.name.to_string())
-                                        .unwrap_or_default();
-                                    let env_var = state
-                                        .provider()
-                                        .map(|p| p.env_var.to_string())
-                                        .unwrap_or_default();
-                                    let tx = test_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let ok = crate::test_api_key(&provider_name, &env_var);
-                                        let _ = tx.send(ok);
-                                    });
+                                    && state.key_test == KeyTestState::Idle =>
+                            {
+                                if let Some(p) = state.provider() {
+                                    let _ = crate::dotenv::save_env_key(
+                                        p.env_var,
+                                        &state.api_key_input,
+                                    );
                                 }
+                                state.key_test = KeyTestState::Testing;
+                                let provider_name = state
+                                    .provider()
+                                    .map(|p| p.name.to_string())
+                                    .unwrap_or_default();
+                                let env_var = state
+                                    .provider()
+                                    .map(|p| p.env_var.to_string())
+                                    .unwrap_or_default();
+                                let tx = test_tx.clone();
+                                std::thread::spawn(move || {
+                                    let ok = crate::test_api_key(&provider_name, &env_var);
+                                    let _ = tx.send(ok);
+                                });
                             }
-                            KeyCode::Char(c) => {
-                                if state.key_test == KeyTestState::Idle {
-                                    state.api_key_input.push(c);
-                                }
+                            KeyCode::Char(c) if state.key_test == KeyTestState::Idle => {
+                                state.api_key_input.push(c);
                             }
-                            KeyCode::Backspace => {
-                                if state.key_test == KeyTestState::Idle {
-                                    state.api_key_input.pop();
-                                }
+                            KeyCode::Backspace if state.key_test == KeyTestState::Idle => {
+                                state.api_key_input.pop();
                             }
                             _ => {}
                         }
@@ -1956,14 +2020,15 @@ fn draw_copilot_auth(f: &mut Frame, area: Rect, state: &mut State) {
         Constraint::Length(1), // code value
         Constraint::Length(1), // blank
         Constraint::Length(1), // url
-        Constraint::Min(0),   // spacer
+        Constraint::Min(0),    // spacer
         Constraint::Length(1), // hint
     ])
     .split(area);
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled("  GitHub Copilot Authentication", Style::default().fg(theme::ACCENT)),
-    ]));
+    let title = Paragraph::new(Line::from(vec![Span::styled(
+        "  GitHub Copilot Authentication",
+        Style::default().fg(theme::ACCENT),
+    )]));
     f.render_widget(title, chunks[0]);
 
     let spinner = theme::SPINNER_FRAMES[state.tick % theme::SPINNER_FRAMES.len()];
@@ -1985,9 +2050,7 @@ fn draw_copilot_auth(f: &mut Frame, area: Rect, state: &mut State) {
             ]));
             f.render_widget(line1, chunks[2]);
 
-            let code_label = Paragraph::new(Line::from(vec![
-                Span::raw("  Enter this code:"),
-            ]));
+            let code_label = Paragraph::new(Line::from(vec![Span::raw("  Enter this code:")]));
             f.render_widget(code_label, chunks[5]);
 
             let code_value = Paragraph::new(Line::from(vec![
@@ -2007,9 +2070,10 @@ fn draw_copilot_auth(f: &mut Frame, area: Rect, state: &mut State) {
             ]));
             f.render_widget(url, chunks[8]);
 
-            let hint = Paragraph::new(Line::from(vec![
-                Span::styled("  [Enter] Open browser", theme::dim_style()),
-            ]));
+            let hint = Paragraph::new(Line::from(vec![Span::styled(
+                "  [Enter] Open browser",
+                theme::dim_style(),
+            )]));
             f.render_widget(hint, chunks[10]);
         }
         CopilotAuthStatus::FetchingModels => {
@@ -2040,9 +2104,10 @@ fn draw_copilot_auth(f: &mut Frame, area: Rect, state: &mut State) {
             ]));
             f.render_widget(line, chunks[2]);
 
-            let hint = Paragraph::new(Line::from(vec![
-                Span::styled("  Esc to go back", theme::dim_style()),
-            ]));
+            let hint = Paragraph::new(Line::from(vec![Span::styled(
+                "  Esc to go back",
+                theme::dim_style(),
+            )]));
             f.render_widget(hint, chunks[10]);
         }
     }
