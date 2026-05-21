@@ -2221,7 +2221,13 @@ pub async fn run_agent_loop_streaming(
                     };
 
                     // Notify client of tool execution result (detect dead consumer)
-                    let preview: String = final_content.chars().take(300).collect();
+                    // agent_send results are user-visible inter-agent replies — send full content
+                    // so downstream consumers (yolox gateway) don't need enrichment hacks.
+                    let preview: String = if tool_call.name == "agent_send" {
+                        final_content.clone()
+                    } else {
+                        final_content.chars().take(300).collect()
+                    };
                     if stream_tx
                         .send(StreamEvent::ToolExecutionResult {
                             id: tool_call.id.clone(),

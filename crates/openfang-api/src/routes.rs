@@ -1817,6 +1817,19 @@ pub async fn send_message_stream(
                             "detail": detail,
                         }))
                         .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::ToolExecutionResult {
+                        name,
+                        result_preview,
+                        is_error,
+                        ..
+                    } => Event::default()
+                        .event("tool_result")
+                        .json_data(serde_json::json!({
+                            "tool": name,
+                            "result": result_preview,
+                            "is_error": is_error,
+                        }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
                     _ => Event::default().comment("skip"),
                 });
                 Some((sse_event, rx))

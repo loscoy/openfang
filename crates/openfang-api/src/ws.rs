@@ -1349,12 +1349,17 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 "is_error": is_error,
             })),
             VerboseLevel::On => {
-                let truncated: String = result_preview.chars().take(200).collect();
+                // agent_send results are user-visible inter-agent replies — never truncate.
+                let result = if name == "agent_send" {
+                    result_preview.clone()
+                } else {
+                    result_preview.chars().take(200).collect()
+                };
                 Some(serde_json::json!({
                     "type": "tool_result",
                     "id": id,
                     "tool": name,
-                    "result": truncated,
+                    "result": result,
                     "is_error": is_error,
                 }))
             }
