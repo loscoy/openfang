@@ -674,6 +674,88 @@ fn strip_injection_markers(content: &str) -> String {
     result
 }
 
+/// Repair sessions left in an interrupted tool-loop state.
+///
+/// When `/stop` aborts an agent mid-tool-execution, `save_session_async` may
+/// have already persisted intermediate state, leaving the session ending with:
+///   `[..., assistant(ToolUse), user(ToolResult)]`  — tools ran but assistant never responded
+///   `[..., assistant(ToolUse)]`                     — tools never ran
+///
+/// If a new user message is appended to such a session, the consecutive user
+/// messages (ToolResults + new question) get merged by `validate_and_repair`
+/// Phase 3, producing a garbled turn that confuses the LLM into returning
+/// empty or malformed responses.
+///
+/// This function strips the incomplete tail so the session reverts to the last
+/// coherent state. Returns the number of messages removed.
+pub fn repair_interrupted_tool_loop(messages: &mut Vec<Message>) -> usize {
+    let mut removed = 0;
+
+    loop {
+        if messages.is_empty() {
+            break;
+        }
+
+        let last = messages.last().unwrap();
+
+        // Case 1: session ends with a User message containing ToolResult blocks.
+        // These are always synthesized by the agent loop (real users never send
+        // ToolResults), so this indicates an interrupted tool execution.
+        if last.role == Role::User && content_has_tool_results(&last.content) {
+            messages.pop();
+            removed += 1;
+
+            // Also remove the preceding assistant ToolUse message if present.
+            if let Some(prev) = messages.last() {
+                if prev.role == Role::Assistant && content_has_tool_use(&prev.content) {
+                    messages.pop();
+                    removed += 1;
+                }
+            }
+            // Loop to handle multi-iteration tool chains.
+            continue;
+        }
+
+        // Case 2: session ends with an Assistant message containing ToolUse
+        // blocks but no meaningful text. The assistant requested tools but they
+        // never ran (abort happened before tool execution).
+        if last.role == Role::Assistant && content_has_tool_use(&last.content) {
+            messages.pop();
+            removed += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    if removed > 0 {
+        warn!(
+            removed,
+            "Stripped interrupted tool-loop tail from session history"
+        );
+    }
+
+    removed
+}
+
+fn content_has_tool_results(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+        _ => false,
+    }
+}
+
+fn content_has_tool_use(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+        _ => false,
+    }
+}
+
 /// Remove NO_REPLY assistant turns and their preceding user-message triggers
 /// from session history. Keeps the last `keep_recent` messages intact to avoid
 /// pruning recent context.
@@ -1459,6 +1541,178 @@ mod tests {
             Message::assistant("Good, thanks!"),
         ];
         prune_heartbeat_turns(&mut messages, 2);
+        assert_eq!(messages.len(), 4);
+    }
+
+    // --- Interrupted tool-loop repair tests ---
+
+    #[test]
+    fn test_repair_interrupted_tool_loop_with_results() {
+        // Session ends with assistant(ToolUse) + user(ToolResult) — the common /stop case
+        let mut messages = vec![
+            Message::user("Search for rust"),
+            Message::assistant("Sure, let me search"),
+            Message::user("Also check crates.io"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-1".to_string(),
+                    name: "web_search".to_string(),
+                    input: serde_json::json!({"query": "rust crates"}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu-1".to_string(),
+                    tool_name: String::new(),
+                    content: "Found results".to_string(),
+                    is_error: false,
+                }]),
+                ..Default::default()
+            },
+        ];
+
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 2);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.last().unwrap().role, Role::User);
+        assert!(matches!(
+            &messages.last().unwrap().content,
+            MessageContent::Text(t) if t.contains("crates.io")
+        ));
+    }
+
+    #[test]
+    fn test_repair_interrupted_tool_loop_no_results() {
+        // Session ends with assistant(ToolUse) only — abort before tools ran
+        let mut messages = vec![
+            Message::user("Do something"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+        ];
+
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_repair_interrupted_multi_iteration_tool_loop() {
+        // Multiple tool iterations interrupted
+        let mut messages = vec![
+            Message::user("Complex task"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu-1".to_string(),
+                    tool_name: String::new(),
+                    content: "result 1".to_string(),
+                    is_error: false,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-2".to_string(),
+                    name: "fetch".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu-2".to_string(),
+                    tool_name: String::new(),
+                    content: "result 2".to_string(),
+                    is_error: false,
+                }]),
+                ..Default::default()
+            },
+        ];
+
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 4);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_repair_interrupted_noop_on_normal_session() {
+        // Normal session ending with assistant text — no repair needed
+        let mut messages = vec![
+            Message::user("Hello"),
+            Message::assistant("Hi there!"),
+            Message::user("How are you?"),
+            Message::assistant("I'm doing well."),
+        ];
+
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
+    fn test_repair_interrupted_empty_session() {
+        let mut messages: Vec<Message> = vec![];
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_repair_interrupted_complete_tool_loop_untouched() {
+        // A complete tool loop (with final assistant response) should not be modified
+        let mut messages = vec![
+            Message::user("Search for rust"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu-1".to_string(),
+                    tool_name: String::new(),
+                    content: "results".to_string(),
+                    is_error: false,
+                }]),
+                ..Default::default()
+            },
+            Message::assistant("Here are the search results."),
+        ];
+
+        let removed = repair_interrupted_tool_loop(&mut messages);
+        assert_eq!(removed, 0);
         assert_eq!(messages.len(), 4);
     }
 }

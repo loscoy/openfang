@@ -1463,12 +1463,9 @@ impl OpenFangKernel {
         }
 
         // Issue #1140: auto-spawn agents from `~/.openfang/agents/<name>/agent.toml`
-        // that are present on disk but not yet in the registry. Without this,
-        // user-placed agent dirs never appear in `GET /api/agents` (and thus
-        // the chat tab's dropdown) until they are explicitly spawned via API
-        // or CLI. We scan the agents directory and call `spawn_agent` for any
-        // valid manifest whose name is not already registered (idempotent).
-        {
+        // that are present on disk but not yet in the registry. Gated behind
+        // `auto_spawn_agents = true` in config.toml (default: false).
+        if kernel.config.auto_spawn_agents {
             let agents_dir = kernel.config.home_dir.join("agents");
             if agents_dir.is_dir() {
                 let mut auto_spawned = 0usize;
@@ -9290,6 +9287,7 @@ system_prompt = "You are a test agent."
         let config = KernelConfig {
             home_dir: home_dir.clone(),
             data_dir: home_dir.join("data"),
+            auto_spawn_agents: true,
             ..KernelConfig::default()
         };
         let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
@@ -9324,6 +9322,7 @@ system_prompt = "You are a test agent."
         let config2 = KernelConfig {
             home_dir: home_dir.clone(),
             data_dir: home_dir.join("data"),
+            auto_spawn_agents: true,
             ..KernelConfig::default()
         };
         let kernel2 = OpenFangKernel::boot_with_config(config2).expect("kernel re-boots");

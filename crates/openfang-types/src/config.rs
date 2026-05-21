@@ -1282,6 +1282,11 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Whether to auto-spawn agents found in `~/.openfang/agents/` at boot.
+    /// Default: `false`. Set to `true` to load all on-disk agent templates
+    /// automatically when the kernel starts.
+    #[serde(default)]
+    pub auto_spawn_agents: bool,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1539,6 +1544,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            auto_spawn_agents: false,
             skills: HashMap::new(),
         }
     }

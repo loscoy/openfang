@@ -396,6 +396,14 @@ pub async fn run_agent_loop(
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
     }
 
+    // Repair sessions left in an interrupted tool-loop state (e.g. after /stop).
+    let interrupted = crate::session_repair::repair_interrupted_tool_loop(&mut session.messages);
+    if interrupted > 0 {
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!("Failed to save repaired session: {e}");
+        }
+    }
+
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
@@ -1622,6 +1630,14 @@ pub async fn run_agent_loop_streaming(
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+    }
+
+    // Repair sessions left in an interrupted tool-loop state (e.g. after /stop).
+    let interrupted = crate::session_repair::repair_interrupted_tool_loop(&mut session.messages);
+    if interrupted > 0 {
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!("Failed to save repaired session (streaming): {e}");
+        }
     }
 
     // Add the user message to session history.
