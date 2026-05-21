@@ -2389,7 +2389,7 @@ impl OpenFangKernel {
             // ping timeout before post-processing finished).
             drop(phase_cb);
 
-            match result {
+            let outcome = match result {
                 Ok(result) => {
                     // Append new messages to canonical session for cross-channel memory
                     if session.messages.len() > messages_before {
@@ -2468,7 +2468,10 @@ impl OpenFangKernel {
                     warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
                     Err(KernelError::OpenFang(e))
                 }
-            }
+            };
+
+            kernel_clone.running_tasks.remove(&agent_id);
+            outcome
         });
 
         // Store abort handle for cancellation support
