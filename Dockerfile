@@ -55,7 +55,8 @@ RUN set -e; \
         ca-certificates curl git python3 python3-pip python3-venv nodejs npm); \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh | bash
+RUN curl -fsSL https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh | bash \
+    && mv "$HOME/.local/bin/officecli" /usr/local/bin/officecli
 
 COPY --from=builder /build/target/release/openfang /usr/local/bin/
 COPY --from=builder /opt/rust-mcp-filesystem/bin/rust-mcp-filesystem /usr/local/bin/
