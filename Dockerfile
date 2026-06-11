@@ -36,6 +36,7 @@ FROM rust:1-slim-bookworm
 RUN set -e; \
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     git \
     python3 \
     python3-pip \
@@ -51,8 +52,10 @@ RUN set -e; \
           fi; \
         done; \
         apt-get update && apt-get install -y --no-install-recommends --fix-missing \
-        ca-certificates git python3 python3-pip python3-venv nodejs npm); \
+        ca-certificates curl git python3 python3-pip python3-venv nodejs npm); \
     rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh | bash
 
 COPY --from=builder /build/target/release/openfang /usr/local/bin/
 COPY --from=builder /opt/rust-mcp-filesystem/bin/rust-mcp-filesystem /usr/local/bin/

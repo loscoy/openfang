@@ -510,6 +510,8 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let mut silent_failure_retries: u32 = 0;
+    const MAX_SILENT_RETRIES: u32 = 3;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -634,26 +636,33 @@ pub async fn run_agent_loop(
                     });
                 }
 
-                // One-shot retry: if the LLM returns empty text with no tool use,
-                // try once more before accepting the empty result.
-                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                // Retry on empty response: if the LLM returns empty text with no tool use,
+                // retry up to MAX_SILENT_RETRIES times for silent failures (0 tokens),
+                // or once for the first iteration.
                 if text.trim().is_empty()
                     && response.tool_calls.is_empty()
                     && !response.has_any_content()
                 {
                     let is_silent_failure =
                         response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
-                    if iteration == 0 || is_silent_failure {
+                    if is_silent_failure {
+                        silent_failure_retries += 1;
+                    }
+                    let can_retry = if is_silent_failure {
+                        silent_failure_retries <= MAX_SILENT_RETRIES
+                    } else {
+                        iteration == 0
+                    };
+                    if can_retry {
                         warn!(
                             agent = %manifest.name,
                             iteration,
                             input_tokens = response.usage.input_tokens,
                             output_tokens = response.usage.output_tokens,
                             silent_failure = is_silent_failure,
-                            "Empty response, retrying once"
+                            silent_retries = silent_failure_retries,
+                            "Empty response, retrying"
                         );
-                        // Re-validate messages before retry — the history may have
-                        // broken tool_use/tool_result pairs that caused the failure.
                         if is_silent_failure {
                             messages = crate::session_repair::validate_and_repair(&messages);
                         }
@@ -1737,6 +1746,8 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let mut silent_failure_retries: u32 = 0;
+    const MAX_SILENT_RETRIES: u32 = 3;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1883,26 +1894,33 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
-                // One-shot retry: if the LLM returns empty text with no tool use,
-                // try once more before accepting the empty result.
-                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                // Retry on empty response: if the LLM returns empty text with no tool use,
+                // retry up to MAX_SILENT_RETRIES times for silent failures (0 tokens),
+                // or once for the first iteration.
                 if text.trim().is_empty()
                     && response.tool_calls.is_empty()
                     && !response.has_any_content()
                 {
                     let is_silent_failure =
                         response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
-                    if iteration == 0 || is_silent_failure {
+                    if is_silent_failure {
+                        silent_failure_retries += 1;
+                    }
+                    let can_retry = if is_silent_failure {
+                        silent_failure_retries <= MAX_SILENT_RETRIES
+                    } else {
+                        iteration == 0
+                    };
+                    if can_retry {
                         warn!(
                             agent = %manifest.name,
                             iteration,
                             input_tokens = response.usage.input_tokens,
                             output_tokens = response.usage.output_tokens,
                             silent_failure = is_silent_failure,
-                            "Empty response (streaming), retrying once"
+                            silent_retries = silent_failure_retries,
+                            "Empty response (streaming), retrying"
                         );
-                        // Re-validate messages before retry — the history may have
-                        // broken tool_use/tool_result pairs that caused the failure.
                         if is_silent_failure {
                             messages = crate::session_repair::validate_and_repair(&messages);
                         }

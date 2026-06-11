@@ -757,8 +757,45 @@ impl LlmDriver for OpenAIDriver {
                 .text()
                 .await
                 .map_err(|e| LlmError::Http(e.to_string()))?;
-            let oai_response: OaiResponse =
-                serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
+
+            // Detect inline errors from providers (e.g. OpenRouter returning 200
+            // with an error object instead of a proper response).
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(err) = raw.get("error") {
+                    let code = err.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+                    let msg = err["message"].as_str().unwrap_or("unknown error");
+                    let err_type = err.pointer("/metadata/error_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    warn!(
+                        code,
+                        error_message = %msg,
+                        error_type = %err_type,
+                        "Provider returned error in 200 response"
+                    );
+                    if (code == 503 || err_type == "provider_overloaded") && attempt < max_retries {
+                        let retry_ms = (attempt + 1) as u64 * 3000;
+                        warn!(retry_ms, "Provider overloaded, retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                        continue;
+                    }
+                    if code == 429 || code == 503 || err_type == "provider_overloaded" {
+                        return Err(LlmError::RateLimited {
+                            retry_after_ms: 5000,
+                        });
+                    }
+                    return Err(LlmError::Api {
+                        status: code as u16,
+                        message: msg.to_string(),
+                    });
+                }
+            }
+
+            let oai_response: OaiResponse = serde_json::from_str(&body).map_err(|e| {
+                let preview = if body.len() > 500 { &body[..500] } else { &body };
+                warn!(error = %e, body_preview = %preview, "Failed to parse OpenAI response");
+                LlmError::Parse(e.to_string())
+            })?;
 
             let choice = oai_response
                 .choices
@@ -1241,6 +1278,7 @@ impl LlmDriver for OpenAIDriver {
             let mut usage = TokenUsage::default();
             let mut chunk_count: u32 = 0;
             let mut sse_line_count: u32 = 0;
+            let mut first_sse_data: Option<String> = None;
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -1263,6 +1301,10 @@ impl LlmDriver for OpenAIDriver {
                         None => continue,
                     };
 
+                    if first_sse_data.is_none() && data != "[DONE]" {
+                        first_sse_data = Some(data.chars().take(500).collect());
+                    }
+
                     if data == "[DONE]" {
                         continue;
                     }
@@ -1271,6 +1313,31 @@ impl LlmDriver for OpenAIDriver {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    // Detect inline errors from providers (e.g. OpenRouter 503 Overloaded).
+                    // These arrive as SSE chunks with an `error` field and empty `choices`.
+                    if let Some(err) = json.get("error") {
+                        let code = err.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+                        let msg = err["message"].as_str().unwrap_or("unknown error");
+                        let err_type = err.pointer("/metadata/error_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        warn!(
+                            code,
+                            error_message = %msg,
+                            error_type = %err_type,
+                            "Provider returned error inside SSE stream"
+                        );
+                        if code == 503 || err_type == "provider_overloaded" {
+                            return Err(LlmError::RateLimited {
+                                retry_after_ms: 3000,
+                            });
+                        }
+                        return Err(LlmError::Api {
+                            status: code as u16,
+                            message: msg.to_string(),
+                        });
+                    }
 
                     // Extract usage if present (some providers send it in the last chunk)
                     if let Some(u) = json.get("usage") {
@@ -1401,12 +1468,16 @@ impl LlmDriver for OpenAIDriver {
                 && usage.input_tokens == 0
                 && usage.output_tokens == 0;
             if is_empty_stream {
+                let buf_preview: String = buffer.chars().take(300).collect();
+                let buf_remaining = buffer.len();
                 warn!(
                     chunks = chunk_count,
                     sse_lines = sse_line_count,
                     finish = ?finish_reason,
-                    buffer_remaining = buffer.len(),
-                    "SSE stream returned empty: 0 content, 0 tokens â€” likely a silently failed request"
+                    buf_remaining,
+                    first_data = ?first_sse_data,
+                    buf_preview = ?buf_preview,
+                    "Empty SSE stream, 0 content 0 tokens"
                 );
             } else {
                 debug!(
